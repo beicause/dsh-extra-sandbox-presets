@@ -1,5 +1,7 @@
 # dsh-workspace-write-extra
 
+English | [简体中文](README.zh-CN.md)
+
 Adds a fourth permission preset to DeepSeek Harness that grants write access to
 configured directories **in addition to** the session workspace.
 
