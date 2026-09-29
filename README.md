@@ -82,6 +82,36 @@ expansion.
 `extraWritableDirs` is a volatile field, so it also appears on the Settings page
 and edits apply live to every session in the profile.
 
+## Compatibility with the harness
+
+This plugin declares no `@deepseek-ai/dsh-*` peer range, and the harness checks
+only such peers. Its compatibility therefore rests on something narrower and
+more exact: **the shape of two mounted services**. That shape is what the code
+actually uses, and it is pinned by `test/contract.test.mjs` against the real
+classes, so a harness upgrade that moves any of it fails the suite immediately
+rather than narrowing the preset in production.
+
+| Depends on | Used by |
+| --- | --- |
+| `fs.checkedTarget(target, policy)` rejects with code `FS_SANDBOX_DENIED` | `lib/fs.mjs` |
+| `fs.resolve(path)` resolves a target carrying `targetKey` | `lib/fs.mjs` |
+| `sandbox.confine(argv, policy, signal)` resolves to an object carrying `argv` | `lib/provider.mjs` |
+| Policy fields `mode` and `sessionId`; result field `argv` | both wrappers |
+| `permissionPresets.presets` and `emitCatalogChanged()` | `lib/service.mjs` |
+| `systemPrompt.context()` and `getContextOrder('SANDBOX_POLICY')` | `lib/service.mjs` |
+
+Two properties keep this robust across upgrades:
+
+* The wrappers call the stock methods through `await`, so a stock method that
+  changes between synchronous and asynchronous keeps working.
+* Both wrappers operate on the returned object rather than assuming a bare argv,
+  so a return value that grows fields keeps working.
+
+When a mounted service does not expose the expected seam at all, the plugin
+**reports it once per service** and leaves the instance untouched. It never
+disables a stock row, so the failure mode of any unexpected harness shape is a
+logged warning and stock behaviour — never a missing filesystem or sandbox.
+
 ## Platform support
 
 * **Linux with `bwrap`** — fully supported. The extra directories join the
@@ -103,6 +133,7 @@ and edits apply live to every session in the profile.
 | `lib/roots.mjs` | Path expansion and containment checks. |
 | `lib/plan.mjs` | Pure bwrap argv transformation. |
 | `cordis.patch.yml` | Inserts the one plugin row. |
+| `test/contract.test.mjs` | Pins the harness seams this plugin extends. |
 
 ## Tests
 
@@ -111,6 +142,9 @@ node --test test/
 ```
 
 `roots.mjs`, `plan.mjs`, and the two wrappers are dependency-free and run
-anywhere. The integration suite needs the DSH packages to be resolvable, so it
-runs from an installed profile; it assembles the real filesystem and sandbox
-provider and asserts both the widening and its exact reversal on unload.
+anywhere. The contract and integration suites need the DSH packages to be
+resolvable, so they run from an installed profile: the contract suite pins the
+real stock seams, and the integration suite assembles the real filesystem and
+sandbox provider and asserts both the widening and its exact reversal on
+unload. Every suite that needs those packages skips with a reason when they are
+absent, and never passes vacuously.

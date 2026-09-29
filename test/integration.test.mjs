@@ -363,3 +363,71 @@ test('wrapping the live provider binds the extra directories per session', { ski
     await rm(base, { recursive: true, force: true })
   }
 })
+
+test('a mounted service without the expected seam is reported, not silently ignored', { skip }, async () => {
+  const { ExtraWritableDirsService } = await import('../lib/service.mjs')
+
+  const warnings = []
+  // Both enforcement services are mounted but neither exposes the interface the
+  // plugin extends, which is what a harness upgrade that moved the seam looks
+  // like. The plugin must say so rather than leaving the preset quietly narrow.
+  const { ctx } = fakeContext({
+    fs: { resolve: async (path) => ({ displayPath: path, targetKey: path }) },
+    sandbox: { restrict: () => 'not the seam' },
+    permissionPresets: { presets: {}, emitCatalogChanged() {} },
+    systemPrompt: { getContextOrder: () => 110, context: () => {} },
+  })
+  ctx.logger.warn = (message) => warnings.push(message)
+
+  new ExtraWritableDirsService(ctx, serviceConfig(ExtraWritableDirsService.Config, {
+    extraWritableDirs: [],
+    presetName: 'workspace-write-extra',
+  }))
+
+  assert.equal(warnings.length, 2, warnings.join('\n'))
+  assert.match(warnings[0], /"fs" service does not expose the interface/)
+  assert.match(warnings[1], /"sandbox" service does not expose the interface/)
+  assert.match(warnings[0], /moved that interface/)
+
+  // Reported once per service, not on every refresh.
+  warnings.length = 0
+  const again = fakeContext({
+    fs: {},
+    sandbox: {},
+    permissionPresets: { presets: {}, emitCatalogChanged() {} },
+    systemPrompt: { getContextOrder: () => 110, context: () => {} },
+  })
+  again.ctx.logger.warn = (message) => warnings.push(message)
+  const service = new ExtraWritableDirsService(again.ctx, serviceConfig(ExtraWritableDirsService.Config, {
+    extraWritableDirs: ['/nonexistent-probe-dir'],
+    presetName: 'workspace-write-extra',
+  }))
+  await service.ready()
+  await service.ready()
+  const seamWarnings = warnings.filter((message) => message.includes('does not expose the interface'))
+  assert.equal(seamWarnings.length, 2, warnings.join('\n'))
+})
+
+test('a recognized service is wrapped without any warning', { skip }, async () => {
+  const { ExtraWritableDirsService } = await import('../lib/service.mjs')
+
+  const warnings = []
+  const { ctx } = fakeContext({
+    fs: { checkedTarget: async () => 'ok', resolve: async (path) => ({ displayPath: path, targetKey: path }) },
+    sandbox: { confine: async (argv) => ({ argv }) },
+    permissionPresets: { presets: {}, emitCatalogChanged() {} },
+    systemPrompt: { getContextOrder: () => 110, context: () => {} },
+  })
+  ctx.logger.warn = (message) => warnings.push(message)
+
+  const service = new ExtraWritableDirsService(ctx, serviceConfig(ExtraWritableDirsService.Config, {
+    extraWritableDirs: [],
+    presetName: 'workspace-write-extra',
+  }))
+  assert.deepEqual(warnings, [], warnings.join('\n'))
+  await service.ready()
+
+  // The wrappers are installed and removal restores the originals.
+  assert.notEqual(ctx.fs.checkedTarget.name, undefined)
+  ctx.disposeEffects()
+})

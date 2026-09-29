@@ -108,16 +108,18 @@ test('the fence wrapper widens only a workspace-write containment denial', async
   undo()
   assert.equal(own.checkedTarget, ownBefore)
 
-  // A wrapped instance is never wrapped twice, and an unfamiliar backend is
-  // left alone rather than broken.
+  // A wrapped instance is never wrapped twice, and an instance without the
+  // expected seam is left untouched and reported as unwrapped (`undefined`),
+  // so the caller can warn instead of degrading in silence.
   const twice = fakeFs(denial())
   const first = applyExtraDirsFence(twice, rootsFor)
   const wrappedOnce = twice.checkedTarget
-  applyExtraDirsFence(twice, rootsFor)
+  assert.equal(typeof applyExtraDirsFence(twice, rootsFor), 'function')
   assert.equal(twice.checkedTarget, wrappedOnce)
   first()
-  assert.equal(typeof applyExtraDirsFence({}, rootsFor), 'function')
-  assert.equal(typeof applyExtraDirsFence(undefined, rootsFor), 'function')
+  assert.equal(applyExtraDirsFence({}, rootsFor), undefined)
+  assert.equal(applyExtraDirsFence(undefined, rootsFor), undefined)
+  assert.equal(applyExtraDirsFence({ checkedTarget: 'not-a-function' }, rootsFor), undefined)
   restore()
 })
 
@@ -163,5 +165,12 @@ test('the confine wrapper binds only for workspace-write and reports other backe
   const undo = applyExtraDirsConfine(plain, { extraRootsFor: () => ['/x'], reportUnsupported: () => {} })
   undo()
   assert.equal(plain.confine, before)
+
+  // An instance without the expected seam is reported as unwrapped instead of
+  // being passed over in silence.
+  const deps = { extraRootsFor: () => ['/x'], reportUnsupported: () => {} }
+  assert.equal(applyExtraDirsConfine({}, deps), undefined)
+  assert.equal(applyExtraDirsConfine(undefined, deps), undefined)
+  assert.equal(applyExtraDirsConfine({ confine: 'not-a-function' }, deps), undefined)
   restore()
 })
