@@ -1,0 +1,31 @@
+{
+  "name": "dsh-workspace-write-extra",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Adds a fourth DSH permission preset, workspace-write-extra, that grants write access to configured extra directories on top of the session workspace. Linux bwrap only.",
+  "type": "module",
+  "main": "lib/service.mjs",
+  "exports": {
+    ".": "./lib/service.mjs",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/schemastery": "~3.18.4"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}
