@@ -44,6 +44,13 @@ fence 的重试**故意也覆盖 `read-only`**：自带 fence 在解析目标之
 写入，因此包装会自行解析目标并与该预设的目录比较。这正是 `read-only` 预设也能授予写入
 的原因，而它授予的恰好就是自己列出的那些目录。
 
+模型可见的那段说明也需要同样修正，因为自带的 `sandbox:policy` 说明只按 mode 生成：
+`read-only` 下它声称什么都不可修改，`workspace-write` 下它只点名工作区，而选中的预设
+实际上还可能让更多目录可写。因此本插件监听 `system-prompt/assemble` 水波，把授予的目录
+**就地**追加到那段说明之后。另起一个自己的 context 更简单，但它会与自带那句话并列而
+互相矛盾；以同一个名字再注册一个 context 也不可行，因为 system-prompt 服务在同一层内
+以名字为键，重名会被拒绝。
+
 由此产生两个性质，两者都很重要：
 
 * **失败是安全的。** 若本插件未能加载，harness 仍保有原有的文件系统与沙箱，而不会
@@ -112,9 +119,10 @@ fence 的重试**故意也覆盖 `read-only`**：自带 fence 在解析目标之
 ## 与 harness 的兼容性
 
 本插件不声明任何 `@deepseek-ai/dsh-*` 的 peer 范围，而 harness 只检查这类 peer。
-因此它的兼容性建立在更精确也更狭窄的东西上：**两个已挂载服务的形状**。这个形状才是
-代码实际使用的东西，并由 `test/contract.test.ts` 对**真实类**加以固定——所以任何
-移动了它的 harness 升级都会立刻让测试失败，而不是在生产环境里悄悄收窄某个预设。
+因此它的兼容性建立在更精确也更狭窄的东西上：**两个已挂载服务的形状**（外加一个事件名
+与一个 context 名）。这个形状才是代码实际使用的东西，其中服务部分由
+`test/contract.test.ts` 对**真实类**加以固定——所以任何移动了它的 harness 升级都会
+立刻让测试失败，而不是在生产环境里悄悄收窄某个预设。
 
 | 依赖 | 使用处 |
 | --- | --- |
@@ -123,7 +131,7 @@ fence 的重试**故意也覆盖 `read-only`**：自带 fence 在解析目标之
 | `sandbox.confine(argv, policy, signal)` 解析为带 `argv` 的对象 | `src/provider.ts` |
 | policy 的 `mode`、`sessionId` 字段；结果的 `argv` 字段 | 两个包装 |
 | `permissionPresets.presets` 与 `emitCatalogChanged()` | `src/service.ts` |
-| `systemPrompt.context()` 与 `getContextOrder('SANDBOX_POLICY')` | `src/service.ts` |
+| `system-prompt/assemble` 水波，以及其中要修正的 `sandbox:policy` context | `src/service.ts` |
 
 有两个性质让它在升级中保持稳健：
 
@@ -147,7 +155,7 @@ fence 的重试**故意也覆盖 `read-only`**：自带 fence 在解析目标之
 
 | 文件 | 作用 |
 | --- | --- |
-| `src/service.ts` | `ctx.sandboxPresets`：持有已配置的预设表、按会话判定哪个预设生效、包装两个执行服务、发布预设，并加入面向模型的说明。 |
+| `src/service.ts` | `ctx.sandboxPresets`：持有已配置的预设表、按会话判定哪个预设生效、包装两个执行服务、发布预设，并在装配水波上修正自带沙箱说明。 |
 | `src/presets.ts` | 归一化配置的预设表，并展开每个预设的目录。 |
 | `src/fs.ts` | 包装运行中文件系统的包含性检查。 |
 | `src/provider.ts` | 包装运行中沙箱 provider 的 `confine`。 |

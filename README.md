@@ -54,6 +54,17 @@ the target itself and compares it against the preset's directories. That is what
 lets a `read-only` preset grant writes, and it grants exactly the directories it
 lists.
 
+The model-facing note needs the same correction, because the stock
+`sandbox:policy` note is rendered from the mode alone: under `read-only` it
+states that nothing may be modified, and under `workspace-write` it names only
+the workspace, while a selected preset may in fact make further directories
+writable. The plugin therefore listens on the `system-prompt/assemble`
+waterfall and appends the granted directories to that note **in place**. A
+second context of its own would have been simpler, but it would sit next to a
+stock sentence it contradicts; a context registered under the same name is not
+an option either, since the system-prompt service keys contexts by name within
+one layer and rejects a duplicate.
+
 Two consequences follow, and both matter:
 
 * **Failure is safe.** If this plugin does not load, the harness keeps the stock
@@ -129,10 +140,11 @@ natural place to write it.
 
 This plugin declares no `@deepseek-ai/dsh-*` peer range, and the harness checks
 only such peers. Its compatibility therefore rests on something narrower and
-more exact: **the shape of two mounted services**. That shape is what the code
-actually uses, and it is pinned by `test/contract.test.ts` against the real
-classes, so a harness upgrade that moves any of it fails the suite immediately
-rather than narrowing a preset in production.
+more exact: **the shape of two mounted services** (plus one event and one
+context name). That shape is what the code actually uses, and the service half
+is pinned by `test/contract.test.ts` against the real classes, so a harness
+upgrade that moves any of it fails the suite immediately rather than narrowing a
+preset in production.
 
 | Depends on | Used by |
 | --- | --- |
@@ -141,7 +153,7 @@ rather than narrowing a preset in production.
 | `sandbox.confine(argv, policy, signal)` resolves to an object carrying `argv` | `src/provider.ts` |
 | Policy fields `mode` and `sessionId`; result field `argv` | both wrappers |
 | `permissionPresets.presets` and `emitCatalogChanged()` | `src/service.ts` |
-| `systemPrompt.context()` and `getContextOrder('SANDBOX_POLICY')` | `src/service.ts` |
+| The `system-prompt/assemble` waterfall, and a `sandbox:policy` context to correct in it | `src/service.ts` |
 
 Two properties keep this robust across upgrades:
 
@@ -170,7 +182,7 @@ logged warning and stock behaviour — never a missing filesystem or sandbox.
 
 | File | Role |
 | --- | --- |
-| `src/service.ts` | `ctx.sandboxPresets`: owns the configured preset table, decides per session which preset applies, wraps the two enforcement services, publishes the presets, and adds the model-facing note. |
+| `src/service.ts` | `ctx.sandboxPresets`: owns the configured preset table, decides per session which preset applies, wraps the two enforcement services, publishes the presets, and corrects the stock sandbox note on the assembly waterfall. |
 | `src/presets.ts` | Normalizes the configured table and expands each preset's directories. |
 | `src/fs.ts` | Wraps the live filesystem's containment check. |
 | `src/provider.ts` | Wraps the live sandbox provider's `confine`. |

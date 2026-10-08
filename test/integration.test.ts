@@ -54,6 +54,7 @@ interface FakeContext {
   effect(run: () => unknown): () => void
   get(name: string): unknown
   inject(names: readonly string[], callback: (scope: FakeContext) => void): void
+  on(name: string, listener: (...args: unknown[]) => unknown): () => void
   /** Run every recorded disposer, in reverse, like a plugin unload. */
   disposeEffects(): void
   [name: string]: unknown
@@ -100,9 +101,11 @@ function fakeContext(services: Record<string, unknown> = {}): {
   ctx: FakeContext
   disposers: Array<() => unknown>
   registered: Map<string, unknown>
+  listeners: Map<string, Array<(...args: unknown[]) => unknown>>
 } {
   const disposers: Array<() => unknown> = []
   const registered = new Map<string, unknown>()
+  const listeners = new Map<string, Array<(...args: unknown[]) => unknown>>()
   const ctx = {
     logger: { warn(..._args: unknown[]) {}, info(..._args: unknown[]) {}, debug(..._args: unknown[]) {} },
     reflect: { provide: (name: string, instance: unknown) => registered.set(name, instance) },
@@ -113,6 +116,12 @@ function fakeContext(services: Record<string, unknown> = {}): {
       return () => {}
     },
     get: (name: string): unknown => ctx[name],
+    on: (name: string, listener: (...args: unknown[]) => unknown) => {
+      const hooks = listeners.get(name) ?? []
+      hooks.push(listener)
+      listeners.set(name, hooks)
+      return () => {}
+    },
     inject: (names: readonly string[], callback: (scope: FakeContext) => void) => {
       if (names.some((name) => ctx[name] === undefined)) return
       callback({
@@ -129,7 +138,7 @@ function fakeContext(services: Record<string, unknown> = {}): {
   ctx.disposeEffects = () => {
     for (const disposer of disposers.splice(0).reverse()) disposer()
   }
-  return { ctx, disposers, registered }
+  return { ctx, disposers, registered, listeners }
 }
 
 /** The plugin accepts any context it is handed; the stand-in is close enough. */
@@ -150,13 +159,9 @@ test('every configured preset is published in the permission table and catalog',
     },
     emitCatalogChanged: () => { catalogChanged.push(1) },
   }
-  const promptContexts: Array<{ name: string; order: number }> = []
-  const { ctx } = fakeContext({
+  const { ctx, listeners } = fakeContext({
     permissionPresets: permissions,
-    systemPrompt: {
-      getContextOrder: () => 110,
-      context: (entry: { name: string; order: number }) => { promptContexts.push(entry) },
-    },
+    systemPrompt: {},
   })
 
   const service = new ExtraSandboxPresetsService(asContext(ctx), serviceConfig(ExtraSandboxPresetsService.Config, {
@@ -175,9 +180,22 @@ test('every configured preset is published in the permission table and catalog',
   // The shipped entries are left exactly as they were.
   assert.deepEqual(permissions.presets['read-only'], { sandbox: 'read-only', approval: 'ask' })
   assert.equal(catalogChanged.length, 1)
-  assert.equal(promptContexts.length, 1)
-  assert.equal(promptContexts[0].name, 'sandbox:preset-write-dirs')
-  assert.equal(promptContexts[0].order, 111)
+
+  // The plugin listens on the assembly waterfall instead of registering a
+  // second context, which would contradict the stock read-only wording.
+  const waterfall = listeners.get('system-prompt/assemble')
+  assert.ok(waterfall !== undefined && waterfall.length === 1, 'the assembly waterfall is listened on')
+  const listener = waterfall[0]
+  const stockNote = 'Current DSH file policy: workspace-write. Any available operation may modify files.'
+  let nextCalls = 0
+  // No session resolves here, so the assembly must pass through untouched.
+  const assembled = await listener(
+    { contexts: [{ name: 'sandbox:policy', text: stockNote }] },
+    { agent: { session: undefined } },
+    async () => { nextCalls += 1; return { contexts: [{ name: 'sandbox:policy', text: stockNote }] } },
+  ) as { contexts: Array<{ name: string; text: string }> }
+  assert.equal(nextCalls, 1, 'the next link of the waterfall still runs')
+  assert.deepEqual(assembled.contexts, [{ name: 'sandbox:policy', text: stockNote }])
 
   // A reserved name is refused instead of shadowing the shipped presets.
   const reserved = fakeContext({ permissionPresets: permissions }).ctx
@@ -249,10 +267,11 @@ test('each preset grants only its own directories, and only to its own session',
     // The permission projection is the only thing deciding enablement.
     let selected = 'workspace-write'
     const session = { id: 'session-1' }
-    const { ctx } = fakeContext({
+    const { ctx, listeners } = fakeContext({
       permissionPresets: { presets: {}, emitCatalogChanged() {} },
       sessionProjections: { stateOf: () => ({ preset: selected }) },
       sessions: { get: (id: string) => (id === session.id ? session : undefined) },
+      systemPrompt: {},
     })
 
     const service = new ExtraSandboxPresetsService(asContext(ctx), serviceConfig(ExtraSandboxPresetsService.Config, {
@@ -274,9 +293,31 @@ test('each preset grants only its own directories, and only to its own session',
     assert.deepEqual(service.rootsFor(session), [workspaceExtra])
     assert.deepEqual(service.rootsForSessionId('session-1'), [workspaceExtra])
 
+    // The stock sandbox note is corrected in place, naming those directories.
+    const listener = listeners.get('system-prompt/assemble')?.[0]
+    assert.ok(listener !== undefined, 'the assembly waterfall is listened on')
+    const stockNote = 'Current DSH file policy: workspace-write. Some platform temporary areas may also be writable.'
+    const assemble = async () => {
+      const assembled = await listener(
+        { contexts: [{ name: 'sandbox:policy', text: stockNote }] },
+        { agent: { session } },
+        async () => ({ contexts: [{ name: 'sandbox:policy', text: stockNote }] }),
+      ) as { contexts: Array<{ name: string; text: string }> }
+      return assembled.contexts[0].text
+    }
+    const widened = await assemble()
+    assert.ok(widened.startsWith(stockNote), 'the stock wording is kept')
+    assert.match(widened, /additionally allows writing these configured directories/)
+    assert.ok(widened.includes(`"${workspaceExtra}"`), 'the granted directory is named')
+
     selected = 'scratch'
     assert.deepEqual(service.rootsFor(session), [scratch])
     assert.deepEqual(service.dirsForPreset('workspace-write-extra'), [workspaceExtra])
+    assert.ok((await assemble()).includes(`"${scratch}"`), 'the note follows the selected preset')
+
+    // A session that selects nothing gets the untouched stock note.
+    selected = 'read-only'
+    assert.equal(await assemble(), stockNote)
 
     // Unknown, absent, and non-configured selections get nothing.
     selected = 'read-only'
@@ -512,7 +553,7 @@ test('a mounted service without the expected seam is reported, not silently igno
     fs: { resolve: async (path: string) => ({ displayPath: path, targetKey: path }) },
     sandbox: { restrict: () => 'not the seam' },
     permissionPresets: { presets: {}, emitCatalogChanged() {} },
-    systemPrompt: { getContextOrder: () => 110, context: () => {} },
+    systemPrompt: {},
   })
   ctx.logger.warn = (message: string) => { warnings.push(message) }
 
@@ -531,7 +572,7 @@ test('a mounted service without the expected seam is reported, not silently igno
     fs: {},
     sandbox: {},
     permissionPresets: { presets: {}, emitCatalogChanged() {} },
-    systemPrompt: { getContextOrder: () => 110, context: () => {} },
+    systemPrompt: {},
   })
   again.ctx.logger.warn = (message: string) => { warnings.push(message) }
   const service = new ExtraSandboxPresetsService(asContext(again.ctx), serviceConfig(ExtraSandboxPresetsService.Config, {
@@ -554,7 +595,7 @@ test('a recognized service is wrapped without any warning', { skip }, async () =
     },
     sandbox: { confine: async (argv: readonly string[]) => ({ argv }) },
     permissionPresets: { presets: {}, emitCatalogChanged() {} },
-    systemPrompt: { getContextOrder: () => 110, context: () => {} },
+    systemPrompt: {},
   })
   ctx.logger.warn = (message: string) => { warnings.push(message) }
 

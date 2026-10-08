@@ -77,18 +77,35 @@ interface PermissionTableHost {
   emitCatalogChanged?(): void
 }
 
-/** The system-prompt surface this plugin contributes a section to. */
-interface SystemPromptHost {
-  /** The ordering slot of a stock section. */
-  getContextOrder(name: string): number
-  /** Registers one model-facing context section. */
-  context(options: {
-    name: string
-    order: number
-    text: (context: { agent?: { session?: unknown } }) => string
-  }): unknown
+/**
+ * The stock sandbox policy note this plugin restates. It is owned by
+ * `@deepseek-ai/dsh-sandbox-policy`, which registers it at
+ * `CONTEXT_ORDERS.SANDBOX_POLICY` and does not export its renderer, so the
+ * note is corrected in place rather than replaced by a second context.
+ */
+const POLICY_CONTEXT = 'sandbox:policy'
+
+/** The part of an assembled prompt this plugin rewrites. */
+interface PromptAssembly {
+  contexts: Array<{ name: string; text: string }>
 }
 
+/**
+ * The system-prompt waterfall this plugin listens on. The event belongs to
+ * `@deepseek-ai/dsh-system-prompt`, which is not a dependency here, so only
+ * the shape this plugin touches is declared.
+ */
+interface AssembleHost {
+  on(
+    name: 'system-prompt/assemble',
+    listener: (
+      assembly: PromptAssembly,
+      context: { agent?: { session?: unknown } },
+      next: () => Promise<PromptAssembly>,
+    ) => Promise<PromptAssembly>,
+    options?: { prepend?: boolean },
+  ): unknown
+}
 /** One rejection reported to the operator, from either normalization stage. */
 interface ReportableRejection {
   readonly name: string
@@ -412,24 +429,30 @@ export class ExtraSandboxPresetsService extends Service {
   }
 
   /**
-   * Contribute a model-facing note naming the directories the session's
-   * selected preset adds, so the agent knows which out-of-workspace paths it
-   * may write. Sits just after the stock sandbox policy section.
+   * Correct the stock sandbox policy note so it accounts for the directories
+   * the session's selected preset adds. The stock note is written from the
+   * sandbox mode alone, so under `read-only` it claims nothing outside the
+   * standing policy is writable even while a configured preset grants more.
+   * The note is amended in place — a second context would contradict it.
    */
   private _publishContext(): void {
     this.ctx.inject(['systemPrompt'], (scope) => {
-      const systemPrompt = (scope as unknown as { systemPrompt?: SystemPromptHost }).systemPrompt
-      if (systemPrompt === undefined) return
-      systemPrompt.context({
-        name: 'sandbox:preset-write-dirs',
-        order: systemPrompt.getContextOrder('SANDBOX_POLICY') + 1,
-        text: (context) => {
-          const roots = this.rootsFor(context.agent?.session)
-          if (roots.length === 0) return ''
-          return 'The current DSH file policy additionally allows writing these configured directories: '
-            + `${roots.map((root) => `"${root}"`).join(', ')}. `
-            + 'They apply only while the permission preset that configures them is selected.'
-        },
+      const assemble = scope as unknown as AssembleHost
+      if (typeof assemble.on !== 'function') return
+      assemble.on('system-prompt/assemble', async (assembly, context, next) => {
+        const assembled = await next()
+        const roots = this.rootsFor(context.agent?.session)
+        if (roots.length === 0) return assembled
+        const note = 'The current DSH file policy additionally allows writing these configured directories: '
+          + `${roots.map((root) => `"${root}"`).join(', ')}. `
+          + 'They apply only while the permission preset that configures them is selected.'
+        return {
+          ...assembled,
+          contexts: assembled.contexts.map((entry) =>
+            entry.name === POLICY_CONTEXT && entry.text.length > 0
+              ? { ...entry, text: `${entry.text} ${note}` }
+              : entry),
+        }
       })
     })
   }
