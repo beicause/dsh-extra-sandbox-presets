@@ -67,6 +67,9 @@ directories are writable *even under the read-only policy above* (the stock
 sentence reads as a flat prohibition), and under `workspace-write` it says they
 are writable *whether or not they are inside the session workspace* (the stock
 sentence names only that path and reads as the whole writable area). A
+`danger-full-access` preset leaves the note untouched: that mode already
+restricts nothing, so "additionally writable directories" would be a false
+statement rather than a correction. A
 second context of its own would have been simpler, but it would sit next to a
 stock sentence it contradicts; a context registered under the same name is not
 an option either, since the system-prompt service keys contexts by name within
@@ -133,6 +136,11 @@ is asynchronous, so a directory only becomes writable after its own successful
 expansion. A preset whose `sandbox` or `approval` is not one of the values above
 is likewise refused with a warning instead of being published, as are the
 reserved names `custom` and `auto`.
+
+`writableDirs` only has an effect under a confined mode. A preset selecting
+`danger-full-access` may list them — they stay visible in the table — but that
+mode confines nothing, so they grant nothing extra and the model-facing note is
+left untouched.
 
 Preset order is configuration order, which is the order the picker offers them.
 

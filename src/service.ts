@@ -37,6 +37,7 @@ import {
   DEFAULT_APPROVAL,
   DEFAULT_SANDBOX,
   SANDBOX_MODES,
+  exceptionClauseFor,
   expandPresetDirs,
   normalizePresets,
   presetSpecOf,
@@ -451,12 +452,10 @@ export class ExtraSandboxPresetsService extends Service {
         // `workspace-write` it names the session workspace as the writable
         // area. The exception is stated outright in each case instead of
         // relying on "additionally" to be read as an override of the sentence
-        // before it.
-        const exception = entry.sandbox === 'read-only'
-          ? ', even under the read-only policy above'
-          : ', whether or not they are inside the session workspace'
+        // before it. `danger-full-access` returned above, so only confined
+        // modes reach the clause.
         const note = 'The current DSH file policy additionally allows writing these configured directories'
-          + exception
+          + exceptionClauseFor(entry.sandbox)
           + ': '
           + `${roots.map((root) => `"${root}"`).join(', ')}. `
           + 'They apply only while the permission preset that configures them is selected.'

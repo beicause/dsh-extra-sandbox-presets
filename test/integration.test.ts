@@ -338,6 +338,53 @@ test('each preset grants only its own directories, and only to its own session',
   }
 })
 
+test('an unconfined preset never amends the stock note', { skip }, async () => {
+  const { ExtraSandboxPresetsService } = await import('../lib/service.js')
+
+  const base = await makeFixture()
+  try {
+    const anywhere = join(base, 'anywhere')
+    await mkdir(anywhere)
+
+    const selected = 'wide'
+    const session = { id: 'session-1' }
+    const { ctx, listeners } = fakeContext({
+      permissionPresets: { presets: {}, emitCatalogChanged() {} },
+      sessionProjections: { stateOf: () => ({ preset: selected }) },
+      sessions: { get: (id: string) => (id === session.id ? session : undefined) },
+      systemPrompt: {},
+    })
+
+    const service = new ExtraSandboxPresetsService(asContext(ctx), serviceConfig(ExtraSandboxPresetsService.Config, {
+      presets: { wide: { sandbox: 'danger-full-access', writableDirs: [anywhere] } },
+    }))
+    await service.ready()
+
+    // The directories are still recorded, so the preset is selectable and its
+    // directories are known; nothing confines, so they grant nothing extra.
+    assert.equal(service.presetFor(session)?.name, 'wide')
+
+    const listener = listeners.get('system-prompt/assemble')?.[0]
+    assert.ok(listener !== undefined)
+    const stockNote = 'Current DSH file policy: danger-full-access. The DSH file sandbox does not restrict file modifications by available operations.'
+    const assembled = await listener(
+      { contexts: [{ name: 'sandbox:policy', text: stockNote }] },
+      { agent: { session } },
+      async () => ({ contexts: [{ name: 'sandbox:policy', text: stockNote }] }),
+    ) as { contexts: Array<{ name: string; text: string }> }
+
+    // `danger-full-access` already allows every path, so a sentence about
+    // "additionally" would be wrong: the note must be left exactly as shipped.
+    assert.equal(assembled.contexts[0].text, stockNote)
+
+    // The enforcement policy is unconfined too: `extraRootsFor` stays empty so
+    // neither wrapper loosens anything.
+    assert.deepEqual(service.extraRootsFor({ mode: 'danger-full-access', sessionId: 'session-1' }), [])
+  } finally {
+    await rm(base, { recursive: true, force: true })
+  }
+})
+
 test('an unusable configured directory is ignored, never granted', { skip }, async () => {
   const { ExtraSandboxPresetsService } = await import('../lib/service.js')
 

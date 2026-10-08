@@ -13,7 +13,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { expandPresetDirs, normalizePresets, presetSpecOf } from '../lib/presets.js'
+import {
+  exceptionClauseFor,
+  expandPresetDirs,
+  normalizePresets,
+  presetSpecOf,
+} from '../lib/presets.js'
 
 /** A stand-in for the volatile config field, which is read through `.get()`. */
 const volatile = (value: unknown) => ({ get: () => value })
@@ -113,4 +118,14 @@ test('expandPresetDirs keeps each preset separate and reports the unusable entri
   } finally {
     await rm(base, { recursive: true, force: true })
   }
+})
+
+test('exceptionClauseFor answers the closed boundary of each confined mode', () => {
+  // `danger-full-access` is not a parameter: it confines nothing, so the note
+  // is never amended for it and there is no clause. The signature rejects it.
+  assert.equal(exceptionClauseFor('read-only'), ', even under the read-only policy above')
+  assert.equal(
+    exceptionClauseFor('workspace-write'),
+    ', whether or not they are inside the session workspace',
+  )
 })

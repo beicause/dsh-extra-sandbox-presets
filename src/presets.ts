@@ -14,6 +14,13 @@ import { expandExtraDirs, type RejectedEntry } from './roots.js'
 /** One sandbox mode a preset may select. */
 export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 
+/**
+ * The sandbox modes that confine. Only these can be widened by extra
+ * directories: `danger-full-access` already allows every path, so a preset
+ * selecting it has nothing to add.
+ */
+export type ConfinedMode = Exclude<SandboxMode, 'danger-full-access'>
+
 /** One approval policy a preset may select. */
 export type ApprovalPolicy = 'ask' | 'never'
 
@@ -185,6 +192,32 @@ export function presetSpecOf(entry: PresetEntry): PresetSpec {
 export interface ExpandedPresetDirs {
   readonly roots: Map<string, string[]>
   readonly unusable: UnusablePresetDir[]
+}
+
+/**
+ * The clause that answers the closed boundary the stock sandbox note draws for
+ * one confined mode.
+ *
+ * The stock note is written from the sandbox mode alone. Under `read-only` it
+ * is a flat prohibition, so the exception has to be stated as one. Under
+ * `workspace-write` it names the session workspace as the writable area, so the
+ * exception has to say the directories count regardless of that boundary.
+ *
+ * `danger-full-access` is deliberately absent: it confines nothing, so this
+ * plugin never amends its note and there is no clause to write. The parameter
+ * type excludes it, so passing an unconfined mode is a compile error rather
+ * than a silently meaningless sentence.
+ *
+ * @param mode - the confined sandbox mode the selected preset uses.
+ * @returns the clause to follow "these configured directories".
+ */
+export function exceptionClauseFor(mode: ConfinedMode): string {
+  switch (mode) {
+    case 'read-only':
+      return ', even under the read-only policy above'
+    case 'workspace-write':
+      return ', whether or not they are inside the session workspace'
+  }
 }
 
 /**
