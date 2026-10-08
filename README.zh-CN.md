@@ -113,17 +113,17 @@ fence 的重试**故意也覆盖 `read-only`**：自带 fence 在解析目标之
 
 本插件不声明任何 `@deepseek-ai/dsh-*` 的 peer 范围，而 harness 只检查这类 peer。
 因此它的兼容性建立在更精确也更狭窄的东西上：**两个已挂载服务的形状**。这个形状才是
-代码实际使用的东西，并由 `test/contract.test.mjs` 对**真实类**加以固定——所以任何
+代码实际使用的东西，并由 `test/contract.test.ts` 对**真实类**加以固定——所以任何
 移动了它的 harness 升级都会立刻让测试失败，而不是在生产环境里悄悄收窄某个预设。
 
 | 依赖 | 使用处 |
 | --- | --- |
-| `fs.checkedTarget(target, policy)` 以错误码 `FS_SANDBOX_DENIED` 拒绝 | `lib/fs.mjs` |
-| `fs.resolve(path)` 解析出带 `targetKey` 的 target | `lib/fs.mjs` |
-| `sandbox.confine(argv, policy, signal)` 解析为带 `argv` 的对象 | `lib/provider.mjs` |
+| `fs.checkedTarget(target, policy)` 以错误码 `FS_SANDBOX_DENIED` 拒绝 | `src/fs.ts` |
+| `fs.resolve(path)` 解析出带 `targetKey` 的 target | `src/fs.ts` |
+| `sandbox.confine(argv, policy, signal)` 解析为带 `argv` 的对象 | `src/provider.ts` |
 | policy 的 `mode`、`sessionId` 字段；结果的 `argv` 字段 | 两个包装 |
-| `permissionPresets.presets` 与 `emitCatalogChanged()` | `lib/service.mjs` |
-| `systemPrompt.context()` 与 `getContextOrder('SANDBOX_POLICY')` | `lib/service.mjs` |
+| `permissionPresets.presets` 与 `emitCatalogChanged()` | `src/service.ts` |
+| `systemPrompt.context()` 与 `getContextOrder('SANDBOX_POLICY')` | `src/service.ts` |
 
 有两个性质让它在升级中保持稳健：
 
@@ -147,14 +147,29 @@ fence 的重试**故意也覆盖 `read-only`**：自带 fence 在解析目标之
 
 | 文件 | 作用 |
 | --- | --- |
-| `lib/service.mjs` | `ctx.sandboxPresets`：持有已配置的预设表、按会话判定哪个预设生效、包装两个执行服务、发布预设，并加入面向模型的说明。 |
-| `lib/presets.mjs` | 归一化配置的预设表，并展开每个预设的目录。 |
-| `lib/fs.mjs` | 包装运行中文件系统的包含性检查。 |
-| `lib/provider.mjs` | 包装运行中沙箱 provider 的 `confine`。 |
-| `lib/roots.mjs` | 路径展开与包含性判定。 |
-| `lib/plan.mjs` | 纯函数式的 bwrap argv 变换。 |
+| `src/service.ts` | `ctx.sandboxPresets`：持有已配置的预设表、按会话判定哪个预设生效、包装两个执行服务、发布预设，并加入面向模型的说明。 |
+| `src/presets.ts` | 归一化配置的预设表，并展开每个预设的目录。 |
+| `src/fs.ts` | 包装运行中文件系统的包含性检查。 |
+| `src/provider.ts` | 包装运行中沙箱 provider 的 `confine`。 |
+| `src/roots.ts` | 路径展开与包含性判定。 |
+| `src/plan.ts` | 纯函数式的 bwrap argv 变换。 |
 | `cordis.patch.yml` | 插入唯一的一行插件。 |
-| `test/contract.test.mjs` | 固定本插件所扩展的 harness 接缝。 |
+| `test/contract.test.ts` | 固定本插件所扩展的 harness 接缝。 |
+
+`lib/` 是 `src/` 的编译产物（`tsc -p tsconfig.build.json`），已被 git 忽略：它是构建
+产物，`src/` 才是唯一事实来源。`prepare` 负责构建它，所以在仓库内执行 `pnpm install`
+即可产出 `lib/`。请改 `src/`，永远不要改 `lib/`。
+
+注意 profile 以**符号链接**（`link:`）安装本包并指向当前工作树，而 pnpm 不会为 `link:`
+依赖执行生命周期脚本——所以经由 profile 安装并不会触发构建。请在仓库内构建，链接进来的
+profile 会直接使用 `lib/` 当前的内容。
+
+## 构建
+
+```
+pnpm run build      # tsc -p tsconfig.build.json -> lib/
+pnpm run typecheck  # tsc -p tsconfig.json (src + test)
+```
 
 ## 测试
 
@@ -162,7 +177,8 @@ fence 的重试**故意也覆盖 `read-only`**：自带 fence 在解析目标之
 node --test test/
 ```
 
-`roots.mjs`、`plan.mjs`、`presets.mjs` 与两个包装都不依赖外部包，随处可运行。契约套件
+`src/roots.ts`、`src/plan.ts`、`src/presets.ts` 与两个包装都不依赖外部包，随处可运行。契约套件
 与集成套件需要 DSH 包可被解析，因此需在已安装的 profile 中运行：契约套件固定真实的原生
 接缝，集成套件则装配真实的文件系统与沙箱 provider，断言放宽生效以及卸载时的精确还原。
-所有需要这些包的套件在包缺失时会带原因跳过，绝不空过。
+所有需要这些包的套件在包缺失时会带原因跳过，绝不空过。测试针对编译产物 `lib/`，所以
+请先运行 `pnpm run build`。

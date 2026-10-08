@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "lib": ["es2022"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    // The DSH packages are installed in this workspace through symlinks. Keeping
+    // symlinked paths unresolvable-as-real keeps the emitted declarations
+    // portable: they name `@deepseek-ai/schemastery` instead of a store path.
+    "preserveSymlinks": true
+  },
+  "include": ["src", "test"]
+}

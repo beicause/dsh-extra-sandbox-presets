@@ -12,8 +12,8 @@
  * and whether the session making a call has that preset selected.
  *
  * It enforces them by wrapping the two live enforcement services in place — the
- * mounted filesystem's containment check (`./fs.mjs`) and the sandbox
- * provider's `confine` (`./provider.mjs`). Neither stock service is disabled,
+ * mounted filesystem's containment check (`./fs.js`) and the sandbox
+ * provider's `confine` (`./provider.js`). Neither stock service is disabled,
  * replaced, or subclassed, so a failure to load this plugin leaves the harness
  * exactly as shipped instead of stripping it of its filesystem or sandbox.
  *
@@ -28,10 +28,10 @@
  * to the live table and the client catalog is invalidated.
  */
 
-import { Service } from '@deepseek-ai/cordis'
+import { Service, type Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { applyExtraDirsFence } from './fs.mjs'
-import { applyExtraDirsConfine } from './provider.mjs'
+import { applyExtraDirsFence } from './fs.js'
+import { applyExtraDirsConfine } from './provider.js'
 import {
   APPROVAL_POLICIES,
   DEFAULT_APPROVAL,
@@ -40,7 +40,9 @@ import {
   expandPresetDirs,
   normalizePresets,
   presetSpecOf,
-} from './presets.mjs'
+  type PresetEntry,
+  type PresetSpec,
+} from './presets.js'
 
 export const name = 'dsh-extra-sandbox-presets'
 
@@ -49,6 +51,54 @@ const PERMISSIONS_KEY = 'permissions'
 
 /** The one sandbox mode that never confines, so extra directories are moot. */
 const UNCONFINED_MODE = 'danger-full-access'
+
+/**
+ * The validated plugin config this service reads.
+ *
+ * `presets` is volatile, so it is a live reference rather than a value; the
+ * concrete type is left open because the service normalizes it itself and a
+ * unit test may hand it a plain table.
+ */
+export interface SandboxPresetsConfig {
+  readonly presets: unknown
+}
+
+/** The resolved per-call policy fields the enforcement path consults. */
+interface ResolvedPolicy {
+  readonly mode?: unknown
+  readonly sessionId?: unknown
+}
+
+/** The permission service surface this plugin publishes into. */
+interface PermissionTableHost {
+  /** The live preset table; `private` in the shipped typings, so declared here. */
+  readonly presets: Record<string, PresetSpec>
+  /** Invalidates a client's cached permission catalog. */
+  emitCatalogChanged?(): void
+}
+
+/** The system-prompt surface this plugin contributes a section to. */
+interface SystemPromptHost {
+  /** The ordering slot of a stock section. */
+  getContextOrder(name: string): number
+  /** Registers one model-facing context section. */
+  context(options: {
+    name: string
+    order: number
+    text: (context: { agent?: { session?: unknown } }) => string
+  }): unknown
+}
+
+/** One rejection reported to the operator, from either normalization stage. */
+interface ReportableRejection {
+  readonly name: string
+  /** Present only for a directory that failed to expand. */
+  readonly entry?: unknown
+  readonly reason: string
+}
+
+const isPermissionTableHost = (value: unknown): value is PermissionTableHost =>
+  typeof value === 'object' && value !== null && typeof (value as PermissionTableHost).presets === 'object'
 
 export class ExtraSandboxPresetsService extends Service {
   static Config = z.object({
@@ -70,23 +120,36 @@ export class ExtraSandboxPresetsService extends Service {
     })).default({}).volatile(),
   })
 
-  constructor(ctx, config) {
+  /** The validated plugin config this instance serves. */
+  readonly config: SandboxPresetsConfig
+
+  /** Normalized configured presets, in configuration order. */
+  private _presets: PresetEntry[] = []
+
+  /** Canonical directories per preset name. */
+  private _dirs = new Map<string, string[]>()
+
+  /** Comparison key of the table the current snapshot came from. */
+  private _key: string | undefined = undefined
+
+  /** Rejections already logged, so the warning is not repeated per refresh. */
+  private _reported: string | undefined = undefined
+
+  /** Guards the one-time unsupported-backend warning. */
+  private _unsupportedReported = false
+
+  /** Enforcement services already reported as missing the expected seam. */
+  private readonly _unrecognizedReported = new Set<string>()
+
+  /** Republish hook, installed once the permission service is available. */
+  private _publish: (() => void) | undefined = undefined
+
+  /** The in-flight directory expansion, so callers can settle it. */
+  private _pending: Promise<void> | undefined = undefined
+
+  constructor(ctx: Context, config: SandboxPresetsConfig) {
     super(ctx, 'sandboxPresets')
     this.config = config
-    /** Normalized configured presets, in configuration order. */
-    this._presets = []
-    /** Canonical directories per preset name. */
-    this._dirs = new Map()
-    /** Comparison key of the table the current snapshot came from. */
-    this._key = undefined
-    /** Rejections already logged, so the warning is not repeated per refresh. */
-    this._reported = undefined
-    /** Guards the one-time unsupported-backend warning. */
-    this._unsupportedReported = false
-    /** Enforcement services already reported as missing the expected seam. */
-    this._unrecognizedReported = new Set()
-    /** Republish hook, installed once the permission service is available. */
-    this._publish = undefined
     this._refresh()
     this._publishPresets()
     this._publishContext()
@@ -102,9 +165,11 @@ export class ExtraSandboxPresetsService extends Service {
    * @param policy - the resolved per-call policy, or `undefined` for a default call.
    * @returns the canonical directories the call may additionally write.
    */
-  extraRootsFor(policy) {
-    if (policy === undefined || policy.mode === UNCONFINED_MODE) return []
-    return this.rootsForSessionId(policy.sessionId)
+  extraRootsFor(policy: unknown): readonly string[] {
+    const resolved = policy as ResolvedPolicy | undefined
+    if (resolved === undefined || resolved === null) return []
+    if (resolved.mode === UNCONFINED_MODE) return []
+    return this.rootsForSessionId(resolved.sessionId)
   }
 
   /**
@@ -117,10 +182,10 @@ export class ExtraSandboxPresetsService extends Service {
    * plugin expects it is reported rather than passed over in silence, so a
    * harness upgrade that moves the seam is visible.
    */
-  _installEnforcement() {
-    for (const serviceName of ['fs', 'sandbox']) {
+  private _installEnforcement(): void {
+    for (const serviceName of ['fs', 'sandbox'] as const) {
       this.ctx.inject([serviceName], (scope) => {
-        const service = scope[serviceName]
+        const service = (scope as unknown as Record<string, unknown>)[serviceName]
         scope.effect(() => {
           const disposer = serviceName === 'fs'
             ? applyExtraDirsFence(service, (policy) => this.extraRootsFor(policy))
@@ -128,7 +193,10 @@ export class ExtraSandboxPresetsService extends Service {
               extraRootsFor: (policy) => this.extraRootsFor(policy),
               reportUnsupported: (runner) => this._reportUnsupported(runner),
             })
-          if (disposer === undefined) this._reportUnrecognized(serviceName)
+          if (disposer === undefined) {
+            this._reportUnrecognized(serviceName)
+            return () => {}
+          }
           return disposer
         })
       })
@@ -141,7 +209,7 @@ export class ExtraSandboxPresetsService extends Service {
    * instead of leaving the presets quietly narrower than they claim.
    * @param serviceName - the service that could not be wrapped.
    */
-  _reportUnrecognized(serviceName) {
+  private _reportUnrecognized(serviceName: string): void {
     const key = `unrecognized:${serviceName}`
     if (this._unrecognizedReported.has(key)) return
     this._unrecognizedReported.add(key)
@@ -157,7 +225,7 @@ export class ExtraSandboxPresetsService extends Service {
    * directories, so the gap is visible instead of silently narrowing a preset.
    * @param runner - the runner program the stock provider selected.
    */
-  _reportUnsupported(runner) {
+  private _reportUnsupported(runner: string): void {
     if (this._unsupportedReported) return
     this._unsupportedReported = true
     this._warn(
@@ -173,13 +241,13 @@ export class ExtraSandboxPresetsService extends Service {
    * unvalidated config in a unit test) is accepted too.
    * @returns the current entries.
    */
-  presets() {
+  presets(): readonly PresetEntry[] {
     this._refresh()
     return this._presets
   }
 
   /** The configured preset names, in the order the picker offers them. */
-  get presetNames() {
+  get presetNames(): readonly string[] {
     this._refresh()
     return this._presets.map((entry) => entry.name)
   }
@@ -191,17 +259,17 @@ export class ExtraSandboxPresetsService extends Service {
    * @param session - the calling session, or `undefined` for agentless calls.
    * @returns the selected configured preset, or `undefined`.
    */
-  presetFor(session) {
+  presetFor(session: unknown): PresetEntry | undefined {
     this._refresh()
-    if (session === undefined) return undefined
+    if (session === undefined || session === null) return undefined
     const state = this.ctx.get('sessionProjections')?.stateOf?.(session, PERMISSIONS_KEY)
-    const selected = state?.preset
+    const selected: unknown = state?.preset
     if (typeof selected !== 'string') return undefined
     return this._presets.find((entry) => entry.name === selected)
   }
 
   /** The canonical directories one configured preset grants. */
-  dirsForPreset(presetName) {
+  dirsForPreset(presetName: string): readonly string[] {
     return this._dirs.get(presetName) ?? []
   }
 
@@ -212,7 +280,7 @@ export class ExtraSandboxPresetsService extends Service {
    * @param session - the calling session, or `undefined` for agentless calls.
    * @returns the canonical directories the call may additionally write.
    */
-  rootsFor(session) {
+  rootsFor(session: unknown): readonly string[] {
     this._refresh()
     const entry = this.presetFor(session)
     return entry === undefined ? [] : this.dirsForPreset(entry.name)
@@ -226,9 +294,9 @@ export class ExtraSandboxPresetsService extends Service {
    * @param sessionId - the session id from the resolved policy.
    * @returns the canonical directories the call may additionally write.
    */
-  rootsForSessionId(sessionId) {
+  rootsForSessionId(sessionId: unknown): readonly string[] {
     this._refresh()
-    if (sessionId === undefined) return []
+    if (sessionId === undefined || sessionId === null) return []
     const session = this.ctx.get('sessions')?.get?.(sessionId)
     return session === undefined ? [] : this.rootsFor(session)
   }
@@ -239,7 +307,7 @@ export class ExtraSandboxPresetsService extends Service {
    * callers until the refresh settles; a directory therefore becomes writable
    * only after its own successful expansion, never before.
    */
-  _refresh() {
+  private _refresh(): Promise<void> | undefined {
     const { entries, rejected } = normalizePresets(this.config.presets)
     const key = JSON.stringify(entries)
     if (key === this._key) return this._pending
@@ -251,8 +319,8 @@ export class ExtraSandboxPresetsService extends Service {
       if (this._key !== key) return
       this._dirs = roots
       this._report([...rejected, ...unusable])
-    }, (error) => {
-      this._warn(`expanding the configured writable directories failed: ${String(error?.message ?? error)}`)
+    }, (error: unknown) => {
+      this._warn(`expanding the configured writable directories failed: ${detailOf(error)}`)
     })
     return this._pending
   }
@@ -263,11 +331,11 @@ export class ExtraSandboxPresetsService extends Service {
    * deliberately does not, it serves the last settled snapshot.
    * @returns a promise resolved once the current expansion has settled.
    */
-  async ready() {
+  async ready(): Promise<void> {
     await this._refresh()
   }
 
-  _report(rejected) {
+  private _report(rejected: readonly ReportableRejection[]): void {
     if (rejected.length === 0) {
       this._reported = undefined
       return
@@ -280,7 +348,7 @@ export class ExtraSandboxPresetsService extends Service {
     this._warn(`ignoring unusable configured presets: ${summary}`)
   }
 
-  _warn(message) {
+  private _warn(message: string): void {
     try {
       this.ctx.logger?.warn?.(`extra-sandbox-presets: ${message}`)
     } catch {
@@ -299,20 +367,20 @@ export class ExtraSandboxPresetsService extends Service {
    * them so its `defaultPreset` resolves without this plugin) is shadowed while
    * this plugin is loaded and restored exactly when it unloads.
    */
-  _publishPresets() {
+  private _publishPresets(): void {
     this.ctx.inject(['permissionPresets'], (scope) => {
-      const permissions = scope.permissionPresets
+      const permissions = (scope as unknown as { permissionPresets?: unknown }).permissionPresets
       scope.effect(() => {
         /** Names this plugin wrote, mapped to the value it replaced. */
-        const applied = new Map()
+        const applied = new Map<string, PresetSpec | undefined>()
 
-        const sync = () => {
-          const table = permissions.presets
-          if (typeof table !== 'object' || table === null) {
+        const sync = (): void => {
+          if (!isPermissionTableHost(permissions)) {
             this._warn('the permission service does not expose its preset table; the configured presets stay unpublished')
             return
           }
-          const wanted = new Map(this._presets.map((entry) => [entry.name, presetSpecOf(entry)]))
+          const table = permissions.presets
+          const wanted = new Map(this._presets.map((entry) => [entry.name, presetSpecOf(entry)] as const))
           for (const [presetName, previous] of applied) {
             if (wanted.has(presetName)) continue
             if (previous === undefined) delete table[presetName]
@@ -330,14 +398,14 @@ export class ExtraSandboxPresetsService extends Service {
         sync()
         return () => {
           this._publish = undefined
-          const table = permissions.presets
-          if (typeof table === 'object' && table !== null) {
+          if (isPermissionTableHost(permissions)) {
+            const table = permissions.presets
             for (const [presetName, previous] of applied) {
               if (previous === undefined) delete table[presetName]
               else table[presetName] = previous
             }
           }
-          permissions.emitCatalogChanged?.()
+          if (isPermissionTableHost(permissions)) permissions.emitCatalogChanged?.()
         }
       })
     })
@@ -348,11 +416,13 @@ export class ExtraSandboxPresetsService extends Service {
    * selected preset adds, so the agent knows which out-of-workspace paths it
    * may write. Sits just after the stock sandbox policy section.
    */
-  _publishContext() {
+  private _publishContext(): void {
     this.ctx.inject(['systemPrompt'], (scope) => {
-      scope.systemPrompt.context({
+      const systemPrompt = (scope as unknown as { systemPrompt?: SystemPromptHost }).systemPrompt
+      if (systemPrompt === undefined) return
+      systemPrompt.context({
         name: 'sandbox:preset-write-dirs',
-        order: scope.systemPrompt.getContextOrder('SANDBOX_POLICY') + 1,
+        order: systemPrompt.getContextOrder('SANDBOX_POLICY') + 1,
         text: (context) => {
           const roots = this.rootsFor(context.agent?.session)
           if (roots.length === 0) return ''
@@ -363,6 +433,12 @@ export class ExtraSandboxPresetsService extends Service {
       })
     })
   }
+}
+
+/** The message of an unknown failure, reproducing `String(error?.message ?? error)`. */
+function detailOf(error: unknown): string {
+  const message = (error as { message?: unknown } | undefined)?.message
+  return String(message ?? error)
 }
 
 export default ExtraSandboxPresetsService

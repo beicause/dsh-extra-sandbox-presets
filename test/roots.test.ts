@@ -1,7 +1,7 @@
 /**
  * Unit tests for the pure path logic behind the extra writable directories.
  *
- * Run with `node test/roots.test.mjs` from the package directory. Uses only
+ * Run with `node test/roots.test.ts` from the package directory. Uses only
  * Node built-ins so it can run without the DSH dependency tree.
  */
 
@@ -11,9 +11,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { absoluteEntry, expandExtraDirs, isPathUnder, isUnderAny } from '../lib/roots.mjs'
+import { absoluteEntry, expandExtraDirs, isPathUnder, isUnderAny } from '../lib/roots.js'
 
-const withTempTree = async (run) => {
+const withTempTree = async (run: (base: string) => Promise<unknown>) => {
   const base = await mkdtemp(join(tmpdir(), 'dsh-extra-dirs-'))
   try {
     return await run(base)
@@ -30,7 +30,9 @@ test('absoluteEntry expands ~ and requires an absolute path', () => {
   assert.equal(absoluteEntry('relative/dir'), undefined)
   assert.equal(absoluteEntry(undefined), undefined)
   assert.equal(absoluteEntry(42), undefined)
-  assert.match(absoluteEntry('~/x'), /\/x$/)
+  const expanded = absoluteEntry('~/x')
+  assert.ok(expanded !== undefined)
+  assert.match(expanded, /\/x$/)
 })
 
 test('expandExtraDirs keeps directories, dedupes, and reports the rest', async () => {
@@ -69,7 +71,7 @@ test('expandExtraDirs resolves a symlinked directory to its target', async () =>
 
     const { dirs } = await expandExtraDirs([link])
     assert.equal(dirs.length, 1)
-    assert.ok(!dirs[0].endsWith('/link'), dirs[0])
+    assert.ok(!dirs[0]!.endsWith('/link'), dirs[0])
   })
 })
 

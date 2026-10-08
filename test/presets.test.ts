@@ -1,10 +1,10 @@
 /**
  * Unit tests for the preset table normalization.
  *
- * `lib/presets.mjs` is dependency-free by design (it only reaches the pure
- * `lib/roots.mjs` helpers), so these run without the DSH packages.
+ * `lib/presets.js` is dependency-free by design (it only reaches the pure
+ * `lib/roots.js` helpers), so these run without the DSH packages.
  *
- * Run with `node --test test/presets.test.mjs`.
+ * Run with `node --test test/presets.test.ts`.
  */
 
 import assert from 'node:assert/strict'
@@ -13,10 +13,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { expandPresetDirs, normalizePresets, presetSpecOf } from '../lib/presets.mjs'
+import { expandPresetDirs, normalizePresets, presetSpecOf } from '../lib/presets.js'
 
 /** A stand-in for the volatile config field, which is read through `.get()`. */
-const volatile = (value) => ({ get: () => value })
+const volatile = (value: unknown) => ({ get: () => value })
 
 test('normalizePresets keeps configuration order and applies the field defaults', () => {
   const { entries, rejected } = normalizePresets({

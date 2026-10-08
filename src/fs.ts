@@ -18,13 +18,41 @@
  * lists and nothing else. `danger-full-access` never fences at all.
  */
 
-import { isPathUnder } from './roots.mjs'
+import { isPathUnder } from './roots.js'
 
 /** Own-property key holding the wrapped method, so wrapping stays idempotent. */
 const WRAPPED = Symbol.for('dsh-extra-sandbox-presets/wrapped-fence')
 
 /** The denial code the stock fence raises for a containment failure. */
 const DENIED = 'FS_SANDBOX_DENIED'
+
+/** The resolved target the stock fence checks and returns. */
+export interface FenceTarget {
+  readonly displayPath: string
+  readonly targetKey: string
+}
+
+/**
+ * The slice of the live filesystem service this wrapper extends. Declared
+ * locally because the host's own typings are not a dependency of this package.
+ */
+interface FenceService {
+  checkedTarget(this: FenceService, target: FenceTarget, sandboxPolicy?: unknown): Promise<FenceTarget>
+  resolve(path: string): Promise<FenceTarget>
+  [key: symbol]: unknown
+}
+
+/** Reports the extra directories that apply to one call's policy. */
+export type ExtraRootsFor = (policy: unknown) => readonly string[]
+
+/** Whether the caught value is the stock fence's containment denial. */
+const isDenial = (error: unknown): boolean =>
+  typeof error === 'object' && error !== null && (error as { code?: unknown }).code === DENIED
+
+const isFenceService = (value: unknown): value is FenceService =>
+  typeof value === 'object'
+  && value !== null
+  && typeof (value as { checkedTarget?: unknown }).checkedTarget === 'function'
 
 /**
  * Wrap one filesystem service instance so it also accepts the extra directories
@@ -40,19 +68,26 @@ const DENIED = 'FS_SANDBOX_DENIED'
  * @returns a disposer restoring the original method exactly, or `undefined`
  *   when this instance could not be wrapped.
  */
-export function applyExtraDirsFence(fs, extraRootsFor) {
-  if (typeof fs?.checkedTarget !== 'function') return undefined
+export function applyExtraDirsFence(
+  fs: unknown,
+  extraRootsFor: ExtraRootsFor,
+): (() => void) | undefined {
+  if (!isFenceService(fs)) return undefined
   if (fs[WRAPPED] !== undefined) return () => {}
   // The mount may define the check on the instance or inherit it from its
   // prototype; the descriptor records which, so restoring is exact either way.
   const descriptor = Object.getOwnPropertyDescriptor(fs, 'checkedTarget')
   const original = fs.checkedTarget
 
-  const wrapped = async function checkedTarget(target, sandboxPolicy) {
+  const wrapped = async function checkedTarget(
+    this: FenceService,
+    target: FenceTarget,
+    sandboxPolicy?: unknown,
+  ): Promise<FenceTarget> {
     try {
       return await original.call(this, target, sandboxPolicy)
     } catch (error) {
-      if (error?.code !== DENIED) throw error
+      if (!isDenial(error)) throw error
 
       const extra = extraRootsFor(sandboxPolicy)
       if (extra.length === 0) throw error
@@ -81,7 +116,7 @@ export function applyExtraDirsFence(fs, extraRootsFor) {
   return () => {
     // Only undo our own wrapping; a later wrapper owns its own restore.
     if (fs[WRAPPED] !== undefined && fs.checkedTarget !== wrapped) return
-    if (descriptor === undefined) delete fs.checkedTarget
+    if (descriptor === undefined) delete (fs as { checkedTarget?: unknown }).checkedTarget
     else Object.defineProperty(fs, 'checkedTarget', descriptor)
     delete fs[WRAPPED]
   }

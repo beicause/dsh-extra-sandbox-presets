@@ -23,10 +23,38 @@
  *     of scope for this plugin.
  */
 
-import { withExtraBinds } from './plan.mjs'
+import { withExtraBinds } from './plan.js'
 
 /** Own-property key holding the wrapped method, so wrapping stays idempotent. */
 const WRAPPED = Symbol.for('dsh-extra-sandbox-presets/wrapped-confine')
+
+/** The confined invocation the stock provider returns. */
+export interface ConfinedArgv {
+  readonly argv: string[]
+  readonly [key: string]: unknown
+}
+
+/**
+ * The slice of the live sandbox provider this wrapper extends. Declared locally
+ * because the host's own typings are not a dependency of this package.
+ */
+interface ConfineService {
+  confine(this: ConfineService, argv: readonly string[], policy?: unknown, signal?: unknown): Promise<ConfinedArgv>
+  [key: symbol]: unknown
+}
+
+/** Reporting hooks the service supplies. */
+export interface ConfineDeps {
+  /** Reports the extra directories that apply to one call's policy. */
+  extraRootsFor: (policy: unknown) => readonly string[]
+  /** Reports a runner whose profile this plugin cannot extend. */
+  reportUnsupported: (runner: string) => void
+}
+
+const isConfineService = (value: unknown): value is ConfineService =>
+  typeof value === 'object'
+  && value !== null
+  && typeof (value as { confine?: unknown }).confine === 'function'
 
 /**
  * Wrap one sandbox provider instance so its confinement also binds the extra
@@ -42,22 +70,30 @@ const WRAPPED = Symbol.for('dsh-extra-sandbox-presets/wrapped-confine')
  * @returns a disposer restoring the original method exactly, or `undefined`
  *   when this instance could not be wrapped.
  */
-export function applyExtraDirsConfine(sandbox, deps) {
-  if (typeof sandbox?.confine !== 'function') return undefined
+export function applyExtraDirsConfine(
+  sandbox: unknown,
+  deps: ConfineDeps,
+): (() => void) | undefined {
+  if (!isConfineService(sandbox)) return undefined
   if (sandbox[WRAPPED] !== undefined) return () => {}
   // The mount may define `confine` on the instance or inherit it from its
   // prototype; the descriptor records which, so restoring is exact either way.
   const descriptor = Object.getOwnPropertyDescriptor(sandbox, 'confine')
   const original = sandbox.confine
 
-  const wrapped = async function confine(argv, policy, signal) {
+  const wrapped = async function confine(
+    this: ConfineService,
+    argv: readonly string[],
+    policy?: unknown,
+    signal?: unknown,
+  ): Promise<ConfinedArgv> {
     const result = await original.call(this, argv, policy, signal)
 
     const extra = deps.extraRootsFor(policy)
     if (extra.length === 0) return result
 
     if (result.argv[0] !== 'bwrap') {
-      deps.reportUnsupported(result.argv[0])
+      deps.reportUnsupported(result.argv[0] ?? '')
       return result
     }
 
@@ -77,7 +113,7 @@ export function applyExtraDirsConfine(sandbox, deps) {
   return () => {
     // Only undo our own wrapping; a later wrapper owns its own restore.
     if (sandbox.confine !== wrapped) return
-    if (descriptor === undefined) delete sandbox.confine
+    if (descriptor === undefined) delete (sandbox as { confine?: unknown }).confine
     else Object.defineProperty(sandbox, 'confine', descriptor)
     delete sandbox[WRAPPED]
   }

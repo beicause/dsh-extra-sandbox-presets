@@ -11,33 +11,70 @@
  * outside an installed profile; run it from a profile to exercise the real
  * classes.
  *
- * Run with `node --test test/contract.test.mjs`.
+ * Run with `node --test test/contract.test.ts`.
  */
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { applyExtraDirsConfine } from '../lib/provider.mjs'
-import { applyExtraDirsFence } from '../lib/fs.mjs'
+import { applyExtraDirsConfine } from '../lib/provider.js'
+import { applyExtraDirsFence } from '../lib/fs.js'
 
-const dsh = async (specifier) => {
+const dsh = async (specifier: string): Promise<unknown> => {
   try {
     return await import(specifier)
   } catch (error) {
-    if (error?.code === 'ERR_MODULE_NOT_FOUND') return undefined
+    if ((error as { code?: unknown } | undefined)?.code === 'ERR_MODULE_NOT_FOUND') return undefined
     throw error
   }
 }
 
-const [fsSandbox, sandboxLocal] = await Promise.all([
+/** One resolved filesystem target, as the fence wrapper reads it. */
+interface FenceTargetShape {
+  readonly displayPath: string
+  readonly targetKey: string
+}
+
+/** The part of the stock sandboxed filesystem this contract pins. */
+interface SandboxedFileSystemInstance {
+  checkedTarget(target: FenceTargetShape, policy?: unknown): Promise<FenceTargetShape>
+  resolve(path: string): Promise<FenceTargetShape>
+  writeText(target: FenceTargetShape, data: string, ...rest: unknown[]): Promise<unknown>
+}
+
+interface SandboxedFileSystemClass {
+  new (ctx: unknown, config: unknown): SandboxedFileSystemInstance
+  readonly prototype: SandboxedFileSystemInstance
+  Config(config: { cwd: string }): unknown
+}
+
+/** The part of the stock local sandbox provider this contract pins. */
+interface SandboxProviderInstance {
+  confine(argv: readonly string[], policy?: unknown, signal?: unknown): Promise<{
+    argv: string[]
+    enforcement: unknown
+  }>
+}
+
+interface SandboxProviderClass {
+  new (ctx: unknown, config: unknown): SandboxProviderInstance
+  readonly prototype: SandboxProviderInstance
+  Config(config: Record<string, unknown>): unknown
+}
+
+const [fsSandbox, sandboxLocal] = (await Promise.all([
   dsh('@deepseek-ai/dsh-fs-sandbox'),
   dsh('@deepseek-ai/dsh-sandbox-local'),
-])
+])) as [
+  { SandboxedFileSystem: SandboxedFileSystemClass } | undefined,
+  { LocalSandboxProvider: SandboxProviderClass } | undefined,
+]
 
-/** The seam `lib/fs.mjs` wraps, and the policy fields `lib/service.mjs` reads. */
+/** The seam `lib/fs.js` wraps, and the policy fields `lib/service.js` reads. */
 test('the stock filesystem still offers the seam the fence wrapper needs', {
   skip: fsSandbox === undefined ? 'the DSH filesystem package is not resolvable here' : false,
 }, async () => {
+  if (fsSandbox === undefined) return
   const proto = fsSandbox.SandboxedFileSystem.prototype
 
   // `applyExtraDirsFence` calls these two, and requires the first to reject
@@ -55,7 +92,7 @@ test('the stock filesystem still offers the seam the fence wrapper needs', {
   // The wrapper must recognize this instance, i.e. it must be wrappable.
   const dispose = applyExtraDirsFence(instance, () => [])
   assert.equal(typeof dispose, 'function', 'the real filesystem instance is recognized and wrapped')
-  dispose()
+  dispose?.()
   assert.equal(instance.checkedTarget, proto.checkedTarget, 'restoring returns the inherited method')
 
   // A denial carries the code the wrapper keys on. Proven through the real
@@ -63,17 +100,18 @@ test('the stock filesystem still offers the seam the fence wrapper needs', {
   const outside = await instance.resolve('/')
   await assert.rejects(
     instance.writeText(outside, 'x', undefined, undefined, { mode: 'read-only', workspaceRoot: process.cwd() }),
-    (error) => {
-      assert.equal(error.code, 'FS_SANDBOX_DENIED', 'the fence denial code the wrapper matches on')
+    (error: unknown) => {
+      assert.equal((error as { code?: unknown }).code, 'FS_SANDBOX_DENIED', 'the fence denial code the wrapper matches on')
       return true
     },
   )
 })
 
-/** The seam `lib/provider.mjs` wraps, and the result fields it reads. */
+/** The seam `lib/provider.js` wraps, and the result fields it reads. */
 test('the stock sandbox provider still offers the seam the confine wrapper needs', {
   skip: sandboxLocal === undefined ? 'the DSH sandbox package is not resolvable here' : false,
 }, async () => {
+  if (sandboxLocal === undefined) return
   const proto = sandboxLocal.LocalSandboxProvider.prototype
   const base = Object.getPrototypeOf(sandboxLocal.LocalSandboxProvider)
 
@@ -96,7 +134,7 @@ test('the stock sandbox provider still offers the seam the confine wrapper needs
   const deps = { extraRootsFor: () => [], reportUnsupported: () => {} }
   const dispose = applyExtraDirsConfine(instance, deps)
   assert.equal(typeof dispose, 'function', 'the real provider instance is recognized and wrapped')
-  dispose()
+  dispose?.()
   assert.equal(instance.confine, proto.confine, 'restoring returns the inherited method')
 
   // On Linux the real provider selects the bwrap rung, and `confine` resolves

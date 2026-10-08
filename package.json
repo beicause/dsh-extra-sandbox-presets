@@ -4,9 +4,13 @@
   "private": true,
   "description": "Registers arbitrary configured DSH permission presets, each selecting a sandbox mode and approval policy plus the directories writable on top of it. Linux bwrap only.",
   "type": "module",
-  "main": "lib/service.mjs",
+  "main": "lib/service.js",
+  "types": "lib/service.d.ts",
   "exports": {
-    ".": "./lib/service.mjs",
+    ".": {
+      "types": "./lib/service.d.ts",
+      "default": "./lib/service.js"
+    },
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
@@ -17,11 +21,18 @@
     "README.zh-CN.md"
   ],
   "scripts": {
-    "test": "node --test test/"
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test test/",
+    "prepare": "pnpm run build"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.0.4",
     "@deepseek-ai/schemastery": "~3.18.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "typescript": "^5.9.3"
   },
   "dsh": {
     "bundle": {

@@ -130,18 +130,18 @@ natural place to write it.
 This plugin declares no `@deepseek-ai/dsh-*` peer range, and the harness checks
 only such peers. Its compatibility therefore rests on something narrower and
 more exact: **the shape of two mounted services**. That shape is what the code
-actually uses, and it is pinned by `test/contract.test.mjs` against the real
+actually uses, and it is pinned by `test/contract.test.ts` against the real
 classes, so a harness upgrade that moves any of it fails the suite immediately
 rather than narrowing a preset in production.
 
 | Depends on | Used by |
 | --- | --- |
-| `fs.checkedTarget(target, policy)` rejects with code `FS_SANDBOX_DENIED` | `lib/fs.mjs` |
-| `fs.resolve(path)` resolves a target carrying `targetKey` | `lib/fs.mjs` |
-| `sandbox.confine(argv, policy, signal)` resolves to an object carrying `argv` | `lib/provider.mjs` |
+| `fs.checkedTarget(target, policy)` rejects with code `FS_SANDBOX_DENIED` | `src/fs.ts` |
+| `fs.resolve(path)` resolves a target carrying `targetKey` | `src/fs.ts` |
+| `sandbox.confine(argv, policy, signal)` resolves to an object carrying `argv` | `src/provider.ts` |
 | Policy fields `mode` and `sessionId`; result field `argv` | both wrappers |
-| `permissionPresets.presets` and `emitCatalogChanged()` | `lib/service.mjs` |
-| `systemPrompt.context()` and `getContextOrder('SANDBOX_POLICY')` | `lib/service.mjs` |
+| `permissionPresets.presets` and `emitCatalogChanged()` | `src/service.ts` |
+| `systemPrompt.context()` and `getContextOrder('SANDBOX_POLICY')` | `src/service.ts` |
 
 Two properties keep this robust across upgrades:
 
@@ -170,14 +170,31 @@ logged warning and stock behaviour — never a missing filesystem or sandbox.
 
 | File | Role |
 | --- | --- |
-| `lib/service.mjs` | `ctx.sandboxPresets`: owns the configured preset table, decides per session which preset applies, wraps the two enforcement services, publishes the presets, and adds the model-facing note. |
-| `lib/presets.mjs` | Normalizes the configured table and expands each preset's directories. |
-| `lib/fs.mjs` | Wraps the live filesystem's containment check. |
-| `lib/provider.mjs` | Wraps the live sandbox provider's `confine`. |
-| `lib/roots.mjs` | Path expansion and containment checks. |
-| `lib/plan.mjs` | Pure bwrap argv transformation. |
+| `src/service.ts` | `ctx.sandboxPresets`: owns the configured preset table, decides per session which preset applies, wraps the two enforcement services, publishes the presets, and adds the model-facing note. |
+| `src/presets.ts` | Normalizes the configured table and expands each preset's directories. |
+| `src/fs.ts` | Wraps the live filesystem's containment check. |
+| `src/provider.ts` | Wraps the live sandbox provider's `confine`. |
+| `src/roots.ts` | Path expansion and containment checks. |
+| `src/plan.ts` | Pure bwrap argv transformation. |
 | `cordis.patch.yml` | Inserts the one plugin row. |
-| `test/contract.test.mjs` | Pins the harness seams this plugin extends. |
+| `test/contract.test.ts` | Pins the harness seams this plugin extends. |
+
+`lib/` is the compiled output of `src/` (`tsc -p tsconfig.build.json`) and is
+git-ignored: it is a build artifact, and `src/` is the only source of truth.
+`prepare` builds it, so `pnpm install` inside the repository produces `lib/`.
+Edit `src/`, never `lib/`.
+
+Note that the profile installs this package by **symlink** (`link:`), pointing at
+this working tree, and pnpm runs no lifecycle script for a `link:` dependency —
+so an install through the profile does not build. Build here, in the repository,
+and the linked profile picks up whatever `lib/` currently holds.
+
+## Build
+
+```
+pnpm run build      # tsc -p tsconfig.build.json -> lib/
+pnpm run typecheck  # tsc -p tsconfig.json (src + test)
+```
 
 ## Tests
 
@@ -185,10 +202,11 @@ logged warning and stock behaviour — never a missing filesystem or sandbox.
 node --test test/
 ```
 
-`roots.mjs`, `plan.mjs`, `presets.mjs`, and the two wrappers are dependency-free
-and run anywhere. The contract and integration suites need the DSH packages to
-be resolvable, so they run from an installed profile: the contract suite pins the
-real stock seams, and the integration suite assembles the real filesystem and
-sandbox provider and asserts both the widening and its exact reversal on unload.
-Every suite that needs those packages skips with a reason when they are absent,
-and never passes vacuously.
+`src/roots.ts`, `src/plan.ts`, `src/presets.ts`, and the two wrappers are
+dependency-free and run anywhere. The contract and integration suites need the
+DSH packages to be resolvable, so they run from an installed profile: the
+contract suite pins the real stock seams, and the integration suite assembles the
+real filesystem and sandbox provider and asserts both the widening and its exact
+reversal on unload. Every suite that needs those packages skips with a reason
+when they are absent, and never passes vacuously. The suite runs against the
+compiled `lib/`, so run `pnpm run build` first.

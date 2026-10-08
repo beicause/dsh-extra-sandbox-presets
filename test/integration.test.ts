@@ -7,7 +7,7 @@
  * running Harness, so it exercises the plugin's own wiring: service
  * registration, preset publication, fs containment retry, and bwrap argv.
  *
- * Run with `node --test test/integration.test.mjs`.
+ * Run with `node --test test/integration.test.ts`.
  */
 
 import assert from 'node:assert/strict'
@@ -15,20 +15,68 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import test from 'node:test'
 
-const dsh = async (specifier) => {
+import type { Context } from '@deepseek-ai/cordis'
+
+const dsh = async (specifier: string): Promise<unknown> => {
   try {
     return await import(specifier)
   } catch (error) {
-    if (error?.code === 'ERR_MODULE_NOT_FOUND') return undefined
+    if ((error as { code?: unknown } | undefined)?.code === 'ERR_MODULE_NOT_FOUND') return undefined
     throw error
   }
 }
 
-const [cordis, fsSandbox, sandboxLocal] = await Promise.all([
+/** The plugin's published preset spec, as the permission table stores it. */
+interface PresetSpecShape {
+  sandbox: string
+  approval: string
+  name?: string
+  description?: string
+}
+
+/** The permission service stand-in this suite publishes into. */
+interface PermissionHostShape {
+  presets: Record<string, PresetSpecShape>
+  emitCatalogChanged(): void
+}
+
+/**
+ * A context just real enough for `Service` registration and `ctx.inject`.
+ * `inject` runs its callback immediately so construction-time wiring is seen,
+ * and `effect` tracks the disposer for symmetric teardown.
+ */
+interface FakeContext {
+  logger: { warn(message: string): void; info(...args: unknown[]): void; debug(...args: unknown[]): void }
+  // `Service` registers itself through the reflection layer.
+  reflect: { provide(name: string, instance: unknown): Map<string, unknown> }
+  registry: Map<string, unknown>
+  // Own effect scope, the way a real plugin fiber provides one.
+  effect(run: () => unknown): () => void
+  get(name: string): unknown
+  inject(names: readonly string[], callback: (scope: FakeContext) => void): void
+  /** Run every recorded disposer, in reverse, like a plugin unload. */
+  disposeEffects(): void
+  [name: string]: unknown
+}
+
+const [cordis, fsSandbox, sandboxLocal] = (await Promise.all([
   dsh('@deepseek-ai/cordis'),
   dsh('@deepseek-ai/dsh-fs-sandbox'),
   dsh('@deepseek-ai/dsh-sandbox-local'),
-])
+])) as [
+  unknown,
+  { SandboxedFileSystem: {
+    new (ctx: unknown, config: unknown): {
+      resolve(path: string): Promise<{ displayPath: string; targetKey: string }>
+      writeText(target: unknown, data: string, ...rest: unknown[]): Promise<unknown>
+      readText(target: unknown): Promise<string>
+    }
+    Config(config: { cwd: string }): unknown
+  } } | undefined,
+  { LocalSandboxProvider: new (ctx: unknown, config: unknown) => {
+    confine(argv: readonly string[], policy?: unknown, signal?: unknown): Promise<{ argv: string[] }>
+  } } | undefined,
+]
 const skip = cordis === undefined ? 'the DSH packages are not resolvable here' : false
 
 /**
@@ -37,62 +85,61 @@ const skip = cordis === undefined ? 'the DSH packages are not resolvable here' :
  * could never produce the containment denial under test.
  */
 const fixtureParent = join(process.cwd(), '.tmp')
-const makeFixture = async () => {
+const makeFixture = async (): Promise<string> => {
   await mkdir(fixtureParent, { recursive: true })
   return mkdtemp(join(fixtureParent, 'esp-'))
 }
 
 /** Validate through the plugin's own schema, the way Cordis does before construction. */
-const serviceConfig = (schema, config) => schema(config)
+const serviceConfig = <I, O>(schema: (config: I) => O, config: I): O => schema(config)
 
 /** A stand-in for the volatile config field, which is read through `.get()`. */
-const volatile = (value) => ({ get: () => value })
+const volatile = (value: unknown) => ({ get: () => value })
 
-/**
- * A context just real enough for `Service` registration and `ctx.inject`.
- * `inject` runs its callback immediately so construction-time wiring is seen,
- * and `effect` tracks the disposer for symmetric teardown.
- */
-function fakeContext(services = {}) {
-  const disposers = []
-  const registered = new Map()
+function fakeContext(services: Record<string, unknown> = {}): {
+  ctx: FakeContext
+  disposers: Array<() => unknown>
+  registered: Map<string, unknown>
+} {
+  const disposers: Array<() => unknown> = []
+  const registered = new Map<string, unknown>()
   const ctx = {
-    logger: { warn() {}, info() {}, debug() {} },
-    // `Service` registers itself through the reflection layer.
-    reflect: { provide: (name, instance) => registered.set(name, instance) },
-    registry: new Map(),
-    // Own effect scope, the way a real plugin fiber provides one.
-    effect: (run) => {
+    logger: { warn(..._args: unknown[]) {}, info(..._args: unknown[]) {}, debug(..._args: unknown[]) {} },
+    reflect: { provide: (name: string, instance: unknown) => registered.set(name, instance) },
+    registry: new Map<string, unknown>(),
+    effect: (run: () => unknown) => {
       const disposer = run()
-      if (typeof disposer === 'function') disposers.push(disposer)
+      if (typeof disposer === 'function') disposers.push(disposer as () => unknown)
       return () => {}
     },
-    get: (name) => ctx[name],
-    inject: (names, callback) => {
+    get: (name: string): unknown => ctx[name],
+    inject: (names: readonly string[], callback: (scope: FakeContext) => void) => {
       if (names.some((name) => ctx[name] === undefined)) return
       callback({
         ...ctx,
         [Symbol.dispose]: undefined,
-        effect: (run) => {
+        effect: (run: () => unknown) => {
           const disposer = run()
-          if (typeof disposer === 'function') disposers.push(disposer)
+          if (typeof disposer === 'function') disposers.push(disposer as () => unknown)
         },
-      })
+      } as unknown as FakeContext)
     },
     ...services,
-  }
-  /** Run every recorded disposer, in reverse, like a plugin unload. */
+  } as unknown as FakeContext
   ctx.disposeEffects = () => {
     for (const disposer of disposers.splice(0).reverse()) disposer()
   }
   return { ctx, disposers, registered }
 }
 
-test('every configured preset is published in the permission table and catalog', { skip }, async () => {
-  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
+/** The plugin accepts any context it is handed; the stand-in is close enough. */
+const asContext = (ctx: FakeContext): Context => ctx as unknown as Context
 
-  const catalogChanged = []
-  const permissions = {
+test('every configured preset is published in the permission table and catalog', { skip }, async () => {
+  const { ExtraSandboxPresetsService } = await import('../lib/service.js')
+
+  const catalogChanged: number[] = []
+  const permissions: PermissionHostShape = {
     presets: {
       'read-only': { sandbox: 'read-only', approval: 'ask' },
       'workspace-write': { sandbox: 'workspace-write', approval: 'ask' },
@@ -101,18 +148,18 @@ test('every configured preset is published in the permission table and catalog',
       'workspace-write-extra': { sandbox: 'workspace-write', approval: 'ask' },
       'danger-full-access': { sandbox: 'danger-full-access', approval: 'never' },
     },
-    emitCatalogChanged: () => catalogChanged.push(1),
+    emitCatalogChanged: () => { catalogChanged.push(1) },
   }
-  const promptContexts = []
+  const promptContexts: Array<{ name: string; order: number }> = []
   const { ctx } = fakeContext({
     permissionPresets: permissions,
     systemPrompt: {
       getContextOrder: () => 110,
-      context: (entry) => promptContexts.push(entry),
+      context: (entry: { name: string; order: number }) => { promptContexts.push(entry) },
     },
   })
 
-  const service = new ExtraSandboxPresetsService(ctx, serviceConfig(ExtraSandboxPresetsService.Config, {
+  const service = new ExtraSandboxPresetsService(asContext(ctx), serviceConfig(ExtraSandboxPresetsService.Config, {
     presets: {
       'workspace-write-extra': { writableDirs: [] },
       rust: { writableDirs: [] },
@@ -134,7 +181,7 @@ test('every configured preset is published in the permission table and catalog',
 
   // A reserved name is refused instead of shadowing the shipped presets.
   const reserved = fakeContext({ permissionPresets: permissions }).ctx
-  const other = new ExtraSandboxPresetsService(reserved, serviceConfig(ExtraSandboxPresetsService.Config, {
+  const other = new ExtraSandboxPresetsService(asContext(reserved), serviceConfig(ExtraSandboxPresetsService.Config, {
     presets: { auto: { sandbox: 'workspace-write' }, good: { sandbox: 'read-only' } },
   }))
   assert.deepEqual(other.presetNames, ['good'])
@@ -142,7 +189,7 @@ test('every configured preset is published in the permission table and catalog',
 
   // A configured preset carries a label only when the caller gave one.
   const labelled = fakeContext({ permissionPresets: permissions }).ctx
-  new ExtraSandboxPresetsService(labelled, serviceConfig(ExtraSandboxPresetsService.Config, {
+  new ExtraSandboxPresetsService(asContext(labelled), serviceConfig(ExtraSandboxPresetsService.Config, {
     presets: { tools: { sandbox: 'read-only', name: 'Tools only', description: 'No workspace write' } },
   }))
   assert.deepEqual(permissions.presets.tools, {
@@ -160,16 +207,21 @@ test('every configured preset is published in the permission table and catalog',
 })
 
 test('a changed preset table is republished live', { skip }, async () => {
-  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
+  const { ExtraSandboxPresetsService } = await import('../lib/service.js')
 
-  const catalogChanged = []
-  const permissions = { presets: {}, emitCatalogChanged: () => catalogChanged.push(1) }
+  const catalogChanged: number[] = []
+  const permissions: PermissionHostShape = {
+    presets: {},
+    emitCatalogChanged: () => { catalogChanged.push(1) },
+  }
   const { ctx } = fakeContext({ permissionPresets: permissions })
 
-  const holder = { table: { rust: { writableDirs: [] } } }
+  const holder: { table: Record<string, unknown> } = { table: { rust: { writableDirs: [] } } }
   // Constructed without schema validation: the point here is the volatile
   // reference the service reads live, not the input shape Cordis validates.
-  const service = new ExtraSandboxPresetsService(ctx, { presets: { get: () => holder.table } })
+  const service = new ExtraSandboxPresetsService(asContext(ctx), {
+    presets: { get: () => holder.table },
+  } as never)
   assert.deepEqual(service.presetNames, ['rust'])
 
   holder.table = { rust: { writableDirs: [] }, scratch: { sandbox: 'read-only' } }
@@ -183,7 +235,7 @@ test('a changed preset table is republished live', { skip }, async () => {
 })
 
 test('each preset grants only its own directories, and only to its own session', { skip }, async () => {
-  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
+  const { ExtraSandboxPresetsService } = await import('../lib/service.js')
 
   const base = await makeFixture()
   try {
@@ -200,10 +252,10 @@ test('each preset grants only its own directories, and only to its own session',
     const { ctx } = fakeContext({
       permissionPresets: { presets: {}, emitCatalogChanged() {} },
       sessionProjections: { stateOf: () => ({ preset: selected }) },
-      sessions: { get: (id) => (id === session.id ? session : undefined) },
+      sessions: { get: (id: string) => (id === session.id ? session : undefined) },
     })
 
-    const service = new ExtraSandboxPresetsService(ctx, serviceConfig(ExtraSandboxPresetsService.Config, {
+    const service = new ExtraSandboxPresetsService(asContext(ctx), serviceConfig(ExtraSandboxPresetsService.Config, {
       presets: {
         'workspace-write-extra': { writableDirs: [workspaceExtra] },
         scratch: { sandbox: 'read-only', writableDirs: [scratch] },
@@ -238,7 +290,7 @@ test('each preset grants only its own directories, and only to its own session',
 })
 
 test('an unusable configured directory is ignored, never granted', { skip }, async () => {
-  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
+  const { ExtraSandboxPresetsService } = await import('../lib/service.js')
 
   const base = await makeFixture()
   try {
@@ -247,16 +299,16 @@ test('an unusable configured directory is ignored, never granted', { skip }, asy
     await mkdir(good)
     await writeFile(file, 'x')
 
-    const warnings = []
+    const warnings: string[] = []
     const session = { id: 's' }
     const { ctx } = fakeContext({
       permissionPresets: { presets: {}, emitCatalogChanged() {} },
       sessionProjections: { stateOf: () => ({ preset: 'rust' }) },
       sessions: { get: () => session },
     })
-    ctx.logger.warn = (message) => warnings.push(message)
+    ctx.logger.warn = (message: string) => { warnings.push(message) }
 
-    const service = new ExtraSandboxPresetsService(ctx, {
+    const service = new ExtraSandboxPresetsService(asContext(ctx), {
       presets: {
         rust: { writableDirs: [good, file, join(base, 'missing'), 'relative'] },
         nope: { sandbox: 'not-a-mode', writableDirs: [good] },
@@ -278,7 +330,8 @@ test('an unusable configured directory is ignored, never granted', { skip }, asy
 })
 
 test('wrapping the live filesystem widens only the selected preset and session', { skip: skip || fsSandbox === undefined ? 'the DSH filesystem package is not resolvable here' : false }, async () => {
-  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
+  if (fsSandbox === undefined) return
+  const { ExtraSandboxPresetsService } = await import('../lib/service.js')
 
   const base = await makeFixture()
   try {
@@ -309,11 +362,13 @@ test('wrapping the live filesystem widens only the selected preset and session',
       // `ctx.inject(['fs', 'sandbox'])` runs the wrapper install immediately.
       sandbox: { async confine() { throw new Error('unused here') } },
       permissionPresets: { presets: {}, emitCatalogChanged() {} },
-      sessionProjections: { stateOf: (session) => ({ preset: session === inside ? selected : 'workspace-write' }) },
-      sessions: { get: (id) => [inside, outside].find((session) => session.id === id) },
+      sessionProjections: {
+        stateOf: (session: { id: string }) => ({ preset: session === inside ? selected : 'workspace-write' }),
+      },
+      sessions: { get: (id: string) => [inside, outside].find((session) => session.id === id) },
     })
 
-    const service = new ExtraSandboxPresetsService(ctx, serviceConfig(ExtraSandboxPresetsService.Config, {
+    const service = new ExtraSandboxPresetsService(asContext(ctx), serviceConfig(ExtraSandboxPresetsService.Config, {
       presets: {
         'workspace-write-extra': { writableDirs: [extra] },
         scratch: { sandbox: 'read-only', writableDirs: [scratch] },
@@ -323,7 +378,8 @@ test('wrapping the live filesystem widens only the selected preset and session',
 
     const target = await fs.resolve(join(extra, 'note.txt'))
     const scratchTarget = await fs.resolve(join(scratch, 'note.txt'))
-    const policyFor = (session, mode = 'workspace-write') => ({ mode, workspaceRoot: workspace, sessionId: session.id })
+    const policyFor = (session: { id: string }, mode = 'workspace-write') =>
+      ({ mode, workspaceRoot: workspace, sessionId: session.id })
 
     // Preset off: the stock fence still refuses, i.e. the wrapper never widens
     // beyond what the session selected.
@@ -376,7 +432,8 @@ test('wrapping the live filesystem widens only the selected preset and session',
 })
 
 test('wrapping the live provider binds the selected preset directories per session', { skip: skip || sandboxLocal === undefined ? 'the DSH sandbox package is not resolvable here' : false }, async () => {
-  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
+  if (sandboxLocal === undefined) return
+  const { ExtraSandboxPresetsService } = await import('../lib/service.js')
 
   const base = await makeFixture()
   try {
@@ -396,20 +453,25 @@ test('wrapping the live provider binds the selected preset directories per sessi
 
     const { ctx } = fakeContext({
       sandbox,
-      fs: { async checkedTarget() { return 'unused' } },
+      fs: { async checkedTarget(_target: unknown, _policy?: unknown) { return 'unused' } },
       permissionPresets: { presets: {}, emitCatalogChanged() {} },
-      sessionProjections: { stateOf: (session) => ({ preset: session === inside ? 'workspace-write-extra' : 'workspace-write' }) },
-      sessions: { get: (id) => [inside, outside].find((session) => session.id === id) },
+      sessionProjections: {
+        stateOf: (session: { id: string }) => ({
+          preset: session === inside ? 'workspace-write-extra' : 'workspace-write',
+        }),
+      },
+      sessions: { get: (id: string) => [inside, outside].find((session) => session.id === id) },
     })
 
-    const service = new ExtraSandboxPresetsService(ctx, serviceConfig(ExtraSandboxPresetsService.Config, {
+    const service = new ExtraSandboxPresetsService(asContext(ctx), serviceConfig(ExtraSandboxPresetsService.Config, {
       presets: { 'workspace-write-extra': { writableDirs: [extra] } },
     }))
     await service.ready()
 
     const argv = ['bash', '-c', 'true']
-    const policy = (session) => ({ mode: 'workspace-write', workspaceRoot: workspace, sessionId: session.id })
-    const bindsOf = (confined) => {
+    const policy = (session: { id: string }) =>
+      ({ mode: 'workspace-write', workspaceRoot: workspace, sessionId: session.id })
+    const bindsOf = (confined: { argv: string[] }) => {
       const at = confined.argv.indexOf('--')
       const binds = []
       for (let index = 0; index < at; index += 1) {
@@ -440,21 +502,21 @@ test('wrapping the live provider binds the selected preset directories per sessi
 })
 
 test('a mounted service without the expected seam is reported, not silently ignored', { skip }, async () => {
-  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
+  const { ExtraSandboxPresetsService } = await import('../lib/service.js')
 
-  const warnings = []
+  const warnings: string[] = []
   // Both enforcement services are mounted but neither exposes the interface the
   // plugin extends, which is what a harness upgrade that moved the seam looks
   // like. The plugin must say so rather than leaving the presets quietly narrow.
   const { ctx } = fakeContext({
-    fs: { resolve: async (path) => ({ displayPath: path, targetKey: path }) },
+    fs: { resolve: async (path: string) => ({ displayPath: path, targetKey: path }) },
     sandbox: { restrict: () => 'not the seam' },
     permissionPresets: { presets: {}, emitCatalogChanged() {} },
     systemPrompt: { getContextOrder: () => 110, context: () => {} },
   })
-  ctx.logger.warn = (message) => warnings.push(message)
+  ctx.logger.warn = (message: string) => { warnings.push(message) }
 
-  new ExtraSandboxPresetsService(ctx, serviceConfig(ExtraSandboxPresetsService.Config, {
+  new ExtraSandboxPresetsService(asContext(ctx), serviceConfig(ExtraSandboxPresetsService.Config, {
     presets: { rust: { writableDirs: [] } },
   }))
 
@@ -471,8 +533,8 @@ test('a mounted service without the expected seam is reported, not silently igno
     permissionPresets: { presets: {}, emitCatalogChanged() {} },
     systemPrompt: { getContextOrder: () => 110, context: () => {} },
   })
-  again.ctx.logger.warn = (message) => warnings.push(message)
-  const service = new ExtraSandboxPresetsService(again.ctx, serviceConfig(ExtraSandboxPresetsService.Config, {
+  again.ctx.logger.warn = (message: string) => { warnings.push(message) }
+  const service = new ExtraSandboxPresetsService(asContext(again.ctx), serviceConfig(ExtraSandboxPresetsService.Config, {
     presets: { rust: { writableDirs: ['/nonexistent-probe-dir'] } },
   }))
   await service.ready()
@@ -482,24 +544,28 @@ test('a mounted service without the expected seam is reported, not silently igno
 })
 
 test('a recognized service is wrapped without any warning', { skip }, async () => {
-  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
+  const { ExtraSandboxPresetsService } = await import('../lib/service.js')
 
-  const warnings = []
+  const warnings: string[] = []
   const { ctx } = fakeContext({
-    fs: { checkedTarget: async () => 'ok', resolve: async (path) => ({ displayPath: path, targetKey: path }) },
-    sandbox: { confine: async (argv) => ({ argv }) },
+    fs: {
+      checkedTarget: async (_target: unknown, _policy?: unknown) => 'ok',
+      resolve: async (path: string) => ({ displayPath: path, targetKey: path }),
+    },
+    sandbox: { confine: async (argv: readonly string[]) => ({ argv }) },
     permissionPresets: { presets: {}, emitCatalogChanged() {} },
     systemPrompt: { getContextOrder: () => 110, context: () => {} },
   })
-  ctx.logger.warn = (message) => warnings.push(message)
+  ctx.logger.warn = (message: string) => { warnings.push(message) }
 
-  const service = new ExtraSandboxPresetsService(ctx, serviceConfig(ExtraSandboxPresetsService.Config, {
+  const service = new ExtraSandboxPresetsService(asContext(ctx), serviceConfig(ExtraSandboxPresetsService.Config, {
     presets: {},
   }))
   assert.deepEqual(warnings, [], warnings.join('\n'))
   await service.ready()
 
   // The wrappers are installed and removal restores the originals.
-  assert.notEqual(ctx.fs.checkedTarget.name, undefined)
+  const wrapped = ctx.fs as { checkedTarget: { name: string } }
+  assert.notEqual(wrapped.checkedTarget.name, undefined)
   ctx.disposeEffects()
 })

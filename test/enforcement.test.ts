@@ -5,28 +5,40 @@
  * service the composition mounted, so a plain stand-in is enough to check the
  * exact widening rule and the exact restore behaviour.
  *
- * Run with `node test/enforcement.test.mjs`.
+ * Run with `node test/enforcement.test.ts`.
  */
 
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { applyExtraDirsFence } from '../lib/fs.mjs'
-import { withExtraBinds } from '../lib/plan.mjs'
-import { applyExtraDirsConfine } from '../lib/provider.mjs'
+import { applyExtraDirsFence } from '../lib/fs.js'
+import { withExtraBinds } from '../lib/plan.js'
+import { applyExtraDirsConfine } from '../lib/provider.js'
+
+/** The resolved target the fence wrapper passes around. */
+interface FenceTarget {
+  readonly displayPath: string
+  readonly targetKey?: string
+}
 
 /** A stand-in filesystem whose stock check throws `thrown`. */
-const fakeFs = (thrown) => ({
-  async checkedTarget() { throw thrown },
-  async resolve(path) { return { displayPath: path, targetKey: path } },
+const fakeFs = (thrown: unknown) => ({
+  async checkedTarget(_target: FenceTarget, _policy?: unknown): Promise<FenceTarget> { throw thrown },
+  async resolve(path: string): Promise<FenceTarget> { return { displayPath: path, targetKey: path } },
 })
 
 /** A stand-in provider returning a bwrap profile. */
-const fakeSandbox = (argv) => ({
-  async confine() {
-    return { argv, enforcement: 'full', denialSignatures: [], runnerFailureRules: [] }
+const fakeSandbox = (argv: readonly string[]) => ({
+  async confine(_argv: readonly string[], _policy?: unknown, _signal?: unknown) {
+    return { argv: [...argv], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] }
   },
 })
+
+/** The policy bag these stand-ins key on. */
+interface FakePolicy {
+  readonly mode?: string
+  readonly extra?: string[]
+}
 
 test('withExtraBinds inserts the binds with the profile, before --', () => {
   const argv = ['bwrap', '--ro-bind', '/', '/', '--bind', '/work', '/work', '--', 'bash', '-c', 'echo -- hi']
@@ -80,7 +92,7 @@ test('the fence wrapper widens a containment denial in any confined mode', async
   )
 
   // A target outside every extra root is still denied.
-  const outside = { ...fakeFs(denial()), async resolve(path) { return { displayPath: path, targetKey: '/other' } } }
+  const outside = { ...fakeFs(denial()), async resolve(path: string) { return { displayPath: path, targetKey: '/other' } } }
   applyExtraDirsFence(outside, rootsFor)
   await assert.rejects(
     outside.checkedTarget({ displayPath: '/other/file.txt' }, { mode: 'workspace-write' }),
@@ -94,7 +106,7 @@ test('the fence wrapper widens a containment denial in any confined mode', async
   await assert.rejects(brokenFs.checkedTarget({ displayPath: '/x' }), (error) => error === unrelated)
 
   // The original check stays authoritative for stock-allowed targets.
-  const allowedFs = { async checkedTarget() { return 'stock-ok' } }
+  const allowedFs = { async checkedTarget(_target: FenceTarget, _policy?: unknown) { return 'stock-ok' } }
   applyExtraDirsFence(allowedFs, rootsFor)
   assert.equal(await allowedFs.checkedTarget({ displayPath: '/work/f' }), 'stock-ok')
 
@@ -102,14 +114,14 @@ test('the fence wrapper widens a containment denial in any confined mode', async
   // method was inherited or an own property.
   const inherited = Object.create({ async checkedTarget() { throw denial() } })
   const inheritedBefore = Object.getOwnPropertyDescriptor(inherited, 'checkedTarget')
-  applyExtraDirsFence(inherited, rootsFor)()
+  applyExtraDirsFence(inherited, rootsFor)?.()
   assert.deepEqual(Object.getOwnPropertyDescriptor(inherited, 'checkedTarget'), inheritedBefore)
 
   const own = fakeFs(denial())
   const ownBefore = own.checkedTarget
   const undo = applyExtraDirsFence(own, rootsFor)
   assert.notEqual(own.checkedTarget, ownBefore)
-  undo()
+  undo?.()
   assert.equal(own.checkedTarget, ownBefore)
 
   // A wrapped instance is never wrapped twice, and an instance without the
@@ -120,20 +132,20 @@ test('the fence wrapper widens a containment denial in any confined mode', async
   const wrappedOnce = twice.checkedTarget
   assert.equal(typeof applyExtraDirsFence(twice, rootsFor), 'function')
   assert.equal(twice.checkedTarget, wrappedOnce)
-  first()
+  first?.()
   assert.equal(applyExtraDirsFence({}, rootsFor), undefined)
   assert.equal(applyExtraDirsFence(undefined, rootsFor), undefined)
   assert.equal(applyExtraDirsFence({ checkedTarget: 'not-a-function' }, rootsFor), undefined)
-  restore()
+  restore?.()
 })
 
 test('the confine wrapper binds the reported directories and reports other backends', async () => {
   const argv = ['bwrap', '--ro-bind', '/', '/', '--bind', '/work', '/work', '--', 'bash', '-c', 'true']
 
-  const unsupported = []
+  const unsupported: string[] = []
   const sandbox = fakeSandbox(argv)
   const restore = applyExtraDirsConfine(sandbox, {
-    extraRootsFor: (policy) => (policy.extra ?? []),
+    extraRootsFor: (policy) => ((policy as FakePolicy | undefined)?.extra ?? []),
     reportUnsupported: (runner) => unsupported.push(runner),
   })
 
@@ -171,7 +183,7 @@ test('the confine wrapper binds the reported directories and reports other backe
   const plain = fakeSandbox(argv)
   const before = plain.confine
   const undo = applyExtraDirsConfine(plain, { extraRootsFor: () => ['/x'], reportUnsupported: () => {} })
-  undo()
+  undo?.()
   assert.equal(plain.confine, before)
 
   // An instance without the expected seam is reported as unwrapped instead of
@@ -180,5 +192,5 @@ test('the confine wrapper binds the reported directories and reports other backe
   assert.equal(applyExtraDirsConfine({}, deps), undefined)
   assert.equal(applyExtraDirsConfine(undefined, deps), undefined)
   assert.equal(applyExtraDirsConfine({ confine: 'not-a-function' }, deps), undefined)
-  restore()
+  restore?.()
 })

@@ -15,10 +15,10 @@
  * @param extra - the canonical extra directories to bind.
  * @returns a new argv; the input is left untouched.
  */
-export function withExtraBinds(argv, extra) {
+export function withExtraBinds(argv: readonly string[], extra: readonly string[]): string[] {
   const separator = argv.indexOf('--')
   const at = separator === -1 ? argv.length : separator
-  const binds = []
+  const binds: string[] = []
   for (const dir of extra) binds.push('--bind', dir, dir)
   return [...argv.slice(0, at), ...binds, ...argv.slice(at)]
 }
