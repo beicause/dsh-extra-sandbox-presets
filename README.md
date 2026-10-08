@@ -59,7 +59,14 @@ The model-facing note needs the same correction, because the stock
 states that nothing may be modified, and under `workspace-write` it names only
 the workspace, while a selected preset may in fact make further directories
 writable. The plugin therefore listens on the `system-prompt/assemble`
-waterfall and appends the granted directories to that note **in place**. A
+waterfall and appends the granted directories to that note **in place**. In both
+confined modes the note reads as a closed boundary, so the appended sentence
+states the exception outright instead of relying on "additionally" alone to be
+read as an override of the sentence before it: under `read-only` it says the
+directories are writable *even under the read-only policy above* (the stock
+sentence reads as a flat prohibition), and under `workspace-write` it says they
+are writable *whether or not they are inside the session workspace* (the stock
+sentence names only that path and reads as the whole writable area). A
 second context of its own would have been simpler, but it would sit next to a
 stock sentence it contradicts; a context registered under the same name is not
 an option either, since the system-prompt service keys contexts by name within

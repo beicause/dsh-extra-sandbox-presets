@@ -431,8 +431,9 @@ export class ExtraSandboxPresetsService extends Service {
   /**
    * Correct the stock sandbox policy note so it accounts for the directories
    * the session's selected preset adds. The stock note is written from the
-   * sandbox mode alone, so under `read-only` it claims nothing outside the
-   * standing policy is writable even while a configured preset grants more.
+   * sandbox mode alone, so it reads as a closed boundary in both confined
+   * modes: under `read-only` it claims nothing is writable at all, and under
+   * `workspace-write` it names the session workspace as the writable area.
    * The note is amended in place — a second context would contradict it.
    */
   private _publishContext(): void {
@@ -441,9 +442,22 @@ export class ExtraSandboxPresetsService extends Service {
       if (typeof assemble.on !== 'function') return
       assemble.on('system-prompt/assemble', async (assembly, context, next) => {
         const assembled = await next()
-        const roots = this.rootsFor(context.agent?.session)
+        const entry = this.presetFor(context.agent?.session)
+        if (entry === undefined || entry.sandbox === UNCONFINED_MODE) return assembled
+        const roots = this.dirsForPreset(entry.name)
         if (roots.length === 0) return assembled
-        const note = 'The current DSH file policy additionally allows writing these configured directories: '
+        // The stock note reads as a closed boundary in both confined modes:
+        // under `read-only` it is a flat prohibition, and under
+        // `workspace-write` it names the session workspace as the writable
+        // area. The exception is stated outright in each case instead of
+        // relying on "additionally" to be read as an override of the sentence
+        // before it.
+        const exception = entry.sandbox === 'read-only'
+          ? ', even under the read-only policy above'
+          : ', whether or not they are inside the session workspace'
+        const note = 'The current DSH file policy additionally allows writing these configured directories'
+          + exception
+          + ': '
           + `${roots.map((root) => `"${root}"`).join(', ')}. `
           + 'They apply only while the permission preset that configures them is selected.'
         return {

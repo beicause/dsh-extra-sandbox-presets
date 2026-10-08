@@ -309,11 +309,19 @@ test('each preset grants only its own directories, and only to its own session',
     assert.ok(widened.startsWith(stockNote), 'the stock wording is kept')
     assert.match(widened, /additionally allows writing these configured directories/)
     assert.ok(widened.includes(`"${workspaceExtra}"`), 'the granted directory is named')
+    // The standing policy is workspace-write, where the stock note names the
+    // session workspace as the writable area, so the exception is stated
+    // against that boundary rather than the read-only one.
+    assert.match(widened, /, whether or not they are inside the session workspace:/)
+    assert.doesNotMatch(widened, /even under the read-only policy/)
 
     selected = 'scratch'
     assert.deepEqual(service.rootsFor(session), [scratch])
     assert.deepEqual(service.dirsForPreset('workspace-write-extra'), [workspaceExtra])
-    assert.ok((await assemble()).includes(`"${scratch}"`), 'the note follows the selected preset')
+    const readOnlyNote = await assemble()
+    assert.ok(readOnlyNote.includes(`"${scratch}"`), 'the note follows the selected preset')
+    // This preset is read-only, so the exception is stated outright.
+    assert.match(readOnlyNote, /even under the read-only policy above/)
 
     // A session that selects nothing gets the untouched stock note.
     selected = 'read-only'
