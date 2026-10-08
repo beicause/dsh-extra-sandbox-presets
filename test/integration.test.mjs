@@ -1,7 +1,7 @@
 /**
- * Offline integration test: assemble the plugin's three pieces the way the
- * profile does, over a hand-built context, and check that the extra preset
- * really widens writes while `/permission` selection decides when.
+ * Offline integration test: assemble the plugin's pieces the way the profile
+ * does, over a hand-built context, and check that configured presets really
+ * widen writes while `/permission` selection decides when.
  *
  * This runs against the real DSH packages (via the scratch link) but without a
  * running Harness, so it exercises the plugin's own wiring: service
@@ -39,11 +39,14 @@ const skip = cordis === undefined ? 'the DSH packages are not resolvable here' :
 const fixtureParent = join(process.cwd(), '.tmp')
 const makeFixture = async () => {
   await mkdir(fixtureParent, { recursive: true })
-  return mkdtemp(join(fixtureParent, 'wwx-'))
+  return mkdtemp(join(fixtureParent, 'esp-'))
 }
 
 /** Validate through the plugin's own schema, the way Cordis does before construction. */
 const serviceConfig = (schema, config) => schema(config)
+
+/** A stand-in for the volatile config field, which is read through `.get()`. */
+const volatile = (value) => ({ get: () => value })
 
 /**
  * A context just real enough for `Service` registration and `ctx.inject`.
@@ -85,14 +88,17 @@ function fakeContext(services = {}) {
   return { ctx, disposers, registered }
 }
 
-test('publishing the preset adds it to the permission table and catalog', { skip }, async () => {
-  const { ExtraWritableDirsService } = await import('../lib/service.mjs')
+test('every configured preset is published in the permission table and catalog', { skip }, async () => {
+  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
 
   const catalogChanged = []
   const permissions = {
     presets: {
       'read-only': { sandbox: 'read-only', approval: 'ask' },
       'workspace-write': { sandbox: 'workspace-write', approval: 'ask' },
+      // The shipped profile declares this one so its `defaultPreset` resolves
+      // without this plugin; the plugin shadows it and restores it on unload.
+      'workspace-write-extra': { sandbox: 'workspace-write', approval: 'ask' },
       'danger-full-access': { sandbox: 'danger-full-access', approval: 'never' },
     },
     emitCatalogChanged: () => catalogChanged.push(1),
@@ -106,43 +112,87 @@ test('publishing the preset adds it to the permission table and catalog', { skip
     },
   })
 
-  const service = new ExtraWritableDirsService(ctx, serviceConfig(ExtraWritableDirsService.Config, {
-    extraWritableDirs: [],
-    presetName: 'workspace-write-extra',
+  const service = new ExtraSandboxPresetsService(ctx, serviceConfig(ExtraSandboxPresetsService.Config, {
+    presets: {
+      'workspace-write-extra': { writableDirs: [] },
+      rust: { writableDirs: [] },
+      scratch: { sandbox: 'read-only', approval: 'never', writableDirs: [] },
+    },
   }))
 
-  // The preset is offered and keeps the stock sandbox mode. It carries no
-  // label, so the picker renders the machine value like the built-in entries.
-  assert.deepEqual(Object.keys(permissions.presets), [
-    'read-only', 'workspace-write', 'danger-full-access', 'workspace-write-extra',
-  ])
-  assert.deepEqual(permissions.presets['workspace-write-extra'], {
-    sandbox: 'workspace-write',
-    approval: 'ask',
-  })
+  // Each configured preset is offered, keeping the configured mode/approval.
+  assert.deepEqual(service.presetNames, ['workspace-write-extra', 'rust', 'scratch'])
+  assert.deepEqual(permissions.presets.rust, { sandbox: 'workspace-write', approval: 'ask' })
+  assert.deepEqual(permissions.presets.scratch, { sandbox: 'read-only', approval: 'never' })
+  assert.deepEqual(permissions.presets['workspace-write-extra'], { sandbox: 'workspace-write', approval: 'ask' })
+  // The shipped entries are left exactly as they were.
+  assert.deepEqual(permissions.presets['read-only'], { sandbox: 'read-only', approval: 'ask' })
   assert.equal(catalogChanged.length, 1)
   assert.equal(promptContexts.length, 1)
-  assert.equal(promptContexts[0].name, 'sandbox:extra-write-dirs')
+  assert.equal(promptContexts[0].name, 'sandbox:preset-write-dirs')
   assert.equal(promptContexts[0].order, 111)
 
   // A reserved name is refused instead of shadowing the shipped presets.
   const reserved = fakeContext({ permissionPresets: permissions }).ctx
-  const other = new ExtraWritableDirsService(reserved, serviceConfig(ExtraWritableDirsService.Config, {
-    extraWritableDirs: [],
-    presetName: 'auto',
+  const other = new ExtraSandboxPresetsService(reserved, serviceConfig(ExtraSandboxPresetsService.Config, {
+    presets: { auto: { sandbox: 'workspace-write' }, good: { sandbox: 'read-only' } },
   }))
-  assert.equal(other.presetName, 'auto')
+  assert.deepEqual(other.presetNames, ['good'])
   assert.equal(permissions.presets.auto, undefined)
-  assert.equal(service.presetName, 'workspace-write-extra')
+
+  // A configured preset carries a label only when the caller gave one.
+  const labelled = fakeContext({ permissionPresets: permissions }).ctx
+  new ExtraSandboxPresetsService(labelled, serviceConfig(ExtraSandboxPresetsService.Config, {
+    presets: { tools: { sandbox: 'read-only', name: 'Tools only', description: 'No workspace write' } },
+  }))
+  assert.deepEqual(permissions.presets.tools, {
+    sandbox: 'read-only',
+    approval: 'ask',
+    name: 'Tools only',
+    description: 'No workspace write',
+  })
+
+  // Unloading restores the shadowed entry and removes the added ones.
+  ctx.disposeEffects()
+  assert.deepEqual(permissions.presets['workspace-write-extra'], { sandbox: 'workspace-write', approval: 'ask' })
+  assert.equal(permissions.presets.rust, undefined)
+  assert.equal(permissions.presets.scratch, undefined)
 })
 
-test('the extra directories apply only while the extra preset is selected', { skip }, async () => {
-  const { ExtraWritableDirsService } = await import('../lib/service.mjs')
+test('a changed preset table is republished live', { skip }, async () => {
+  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
+
+  const catalogChanged = []
+  const permissions = { presets: {}, emitCatalogChanged: () => catalogChanged.push(1) }
+  const { ctx } = fakeContext({ permissionPresets: permissions })
+
+  const holder = { table: { rust: { writableDirs: [] } } }
+  // Constructed without schema validation: the point here is the volatile
+  // reference the service reads live, not the input shape Cordis validates.
+  const service = new ExtraSandboxPresetsService(ctx, { presets: { get: () => holder.table } })
+  assert.deepEqual(service.presetNames, ['rust'])
+
+  holder.table = { rust: { writableDirs: [] }, scratch: { sandbox: 'read-only' } }
+  assert.deepEqual(service.presetNames, ['rust', 'scratch'])
+  assert.deepEqual(permissions.presets.scratch, { sandbox: 'read-only', approval: 'ask' })
+
+  // A preset that disappears is withdrawn again.
+  holder.table = { scratch: { sandbox: 'read-only' } }
+  assert.deepEqual(service.presetNames, ['scratch'])
+  assert.equal(permissions.presets.rust, undefined)
+})
+
+test('each preset grants only its own directories, and only to its own session', { skip }, async () => {
+  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
 
   const base = await makeFixture()
   try {
-    const extra = join(base, 'extra')
-    await mkdir(extra)
+    const workspaceExtra = join(base, 'workspace-extra')
+    const scratch = join(base, 'scratch')
+    const unused = join(base, 'unused')
+    await mkdir(workspaceExtra)
+    await mkdir(scratch)
+    await mkdir(unused)
 
     // The permission projection is the only thing deciding enablement.
     let selected = 'workspace-write'
@@ -153,23 +203,32 @@ test('the extra directories apply only while the extra preset is selected', { sk
       sessions: { get: (id) => (id === session.id ? session : undefined) },
     })
 
-    const service = new ExtraWritableDirsService(ctx, serviceConfig(ExtraWritableDirsService.Config, {
-      extraWritableDirs: [extra],
-      presetName: 'workspace-write-extra',
+    const service = new ExtraSandboxPresetsService(ctx, serviceConfig(ExtraSandboxPresetsService.Config, {
+      presets: {
+        'workspace-write-extra': { writableDirs: [workspaceExtra] },
+        scratch: { sandbox: 'read-only', writableDirs: [scratch] },
+      },
     }))
     await service.ready()
 
-    // Selected preset off: no directories apply even though they resolve.
-    assert.equal(service.activeFor(session), false)
+    // No configured preset selected: nothing applies even though it resolves.
+    assert.equal(service.presetFor(session), undefined)
     assert.deepEqual(service.rootsFor(session), [])
     assert.deepEqual(service.rootsForSessionId('session-1'), [])
 
-    // Selected preset on: they apply for that session only.
+    // Selecting one grants exactly that one's directories.
     selected = 'workspace-write-extra'
-    assert.equal(service.activeFor(session), true)
-    assert.deepEqual(service.rootsFor(session), [extra])
-    assert.deepEqual(service.rootsForSessionId('session-1'), [extra])
-    // Unknown or absent sessions get nothing.
+    assert.equal(service.presetFor(session)?.name, 'workspace-write-extra')
+    assert.deepEqual(service.rootsFor(session), [workspaceExtra])
+    assert.deepEqual(service.rootsForSessionId('session-1'), [workspaceExtra])
+
+    selected = 'scratch'
+    assert.deepEqual(service.rootsFor(session), [scratch])
+    assert.deepEqual(service.dirsForPreset('workspace-write-extra'), [workspaceExtra])
+
+    // Unknown, absent, and non-configured selections get nothing.
+    selected = 'read-only'
+    assert.deepEqual(service.rootsFor(session), [])
     assert.deepEqual(service.rootsForSessionId('nope'), [])
     assert.deepEqual(service.rootsForSessionId(undefined), [])
     assert.deepEqual(service.rootsFor(undefined), [])
@@ -178,8 +237,8 @@ test('the extra directories apply only while the extra preset is selected', { sk
   }
 })
 
-test('an unusable configured entry is ignored, never granted', { skip }, async () => {
-  const { ExtraWritableDirsService } = await import('../lib/service.mjs')
+test('an unusable configured directory is ignored, never granted', { skip }, async () => {
+  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
 
   const base = await makeFixture()
   try {
@@ -192,37 +251,43 @@ test('an unusable configured entry is ignored, never granted', { skip }, async (
     const session = { id: 's' }
     const { ctx } = fakeContext({
       permissionPresets: { presets: {}, emitCatalogChanged() {} },
-      sessionProjections: { stateOf: () => ({ preset: 'workspace-write-extra' }) },
+      sessionProjections: { stateOf: () => ({ preset: 'rust' }) },
       sessions: { get: () => session },
     })
     ctx.logger.warn = (message) => warnings.push(message)
 
-    const service = new ExtraWritableDirsService(ctx, serviceConfig(ExtraWritableDirsService.Config, {
-      extraWritableDirs: [good, file, join(base, 'missing'), 'relative'],
-      presetName: 'workspace-write-extra',
-    }))
+    const service = new ExtraSandboxPresetsService(ctx, {
+      presets: {
+        rust: { writableDirs: [good, file, join(base, 'missing'), 'relative'] },
+        nope: { sandbox: 'not-a-mode', writableDirs: [good] },
+      },
+    })
     await service.ready()
 
-    assert.deepEqual(service.roots, [good])
+    assert.deepEqual(service.dirsForPreset('rust'), [good])
     assert.deepEqual(service.rootsFor(session), [good])
+    assert.deepEqual(service.presetNames, ['rust'])
     assert.equal(warnings.length, 1, warnings.join('\n'))
-    assert.match(warnings[0], /ignoring unusable extraWritableDirs entries/)
+    assert.match(warnings[0], /ignoring unusable configured presets/)
     assert.match(warnings[0], /not a directory/)
     assert.match(warnings[0], /does not exist/)
+    assert.match(warnings[0], /unknown sandbox mode "not-a-mode"/)
   } finally {
     await rm(base, { recursive: true, force: true })
   }
 })
 
-test('wrapping the live filesystem widens only the selected session', { skip: skip || fsSandbox === undefined ? 'the DSH filesystem package is not resolvable here' : false }, async () => {
-  const { ExtraWritableDirsService } = await import('../lib/service.mjs')
+test('wrapping the live filesystem widens only the selected preset and session', { skip: skip || fsSandbox === undefined ? 'the DSH filesystem package is not resolvable here' : false }, async () => {
+  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
 
   const base = await makeFixture()
   try {
     const workspace = join(base, 'workspace')
     const extra = join(base, 'extra')
+    const scratch = join(base, 'scratch')
     await mkdir(workspace)
     await mkdir(extra)
+    await mkdir(scratch)
 
     let selected = 'workspace-write'
     const inside = { id: 'inside' }
@@ -248,14 +313,17 @@ test('wrapping the live filesystem widens only the selected session', { skip: sk
       sessions: { get: (id) => [inside, outside].find((session) => session.id === id) },
     })
 
-    const service = new ExtraWritableDirsService(ctx, serviceConfig(ExtraWritableDirsService.Config, {
-      extraWritableDirs: [extra],
-      presetName: 'workspace-write-extra',
+    const service = new ExtraSandboxPresetsService(ctx, serviceConfig(ExtraSandboxPresetsService.Config, {
+      presets: {
+        'workspace-write-extra': { writableDirs: [extra] },
+        scratch: { sandbox: 'read-only', writableDirs: [scratch] },
+      },
     }))
     await service.ready()
 
     const target = await fs.resolve(join(extra, 'note.txt'))
-    const policyFor = (session) => ({ mode: 'workspace-write', workspaceRoot: workspace, sessionId: session.id })
+    const scratchTarget = await fs.resolve(join(scratch, 'note.txt'))
+    const policyFor = (session, mode = 'workspace-write') => ({ mode, workspaceRoot: workspace, sessionId: session.id })
 
     // Preset off: the stock fence still refuses, i.e. the wrapper never widens
     // beyond what the session selected.
@@ -280,27 +348,35 @@ test('wrapping the live filesystem widens only the selected session', { skip: sk
       { code: 'FS_SANDBOX_DENIED' },
     )
 
-    // read-only refuses regardless of the extra directories.
+    // A different preset grants a different directory: the workspace-write one
+    // no longer applies, and the read-only one does.
+    selected = 'scratch'
     await assert.rejects(
-      fs.writeText(target, 'd', undefined, undefined, { ...policyFor(inside), mode: 'read-only' }),
+      fs.writeText(target, 'd', undefined, undefined, policyFor(inside)),
       { code: 'FS_SANDBOX_DENIED' },
     )
-    assert.equal(await fs.readText(target), 'b')
+    await fs.writeText(scratchTarget, 'd', undefined, undefined, policyFor(inside, 'read-only'))
+    assert.equal(await fs.readText(scratchTarget), 'd')
+    // Outside that preset's directory, read-only still refuses.
+    await assert.rejects(
+      fs.writeText(otherTarget, 'e', undefined, undefined, policyFor(inside, 'read-only')),
+      { code: 'FS_SANDBOX_DENIED' },
+    )
 
     // Unloading restores the stock fence exactly: the widening is gone.
     ctx.disposeEffects()
     await assert.rejects(
-      fs.writeText(target, 'e', undefined, undefined, policyFor(inside)),
+      fs.writeText(scratchTarget, 'f', undefined, undefined, policyFor(inside, 'read-only')),
       { code: 'FS_SANDBOX_DENIED' },
     )
-    assert.equal(await fs.readText(target), 'b')
+    assert.equal(await fs.readText(scratchTarget), 'd')
   } finally {
     await rm(base, { recursive: true, force: true })
   }
 })
 
-test('wrapping the live provider binds the extra directories per session', { skip: skip || sandboxLocal === undefined ? 'the DSH sandbox package is not resolvable here' : false }, async () => {
-  const { ExtraWritableDirsService } = await import('../lib/service.mjs')
+test('wrapping the live provider binds the selected preset directories per session', { skip: skip || sandboxLocal === undefined ? 'the DSH sandbox package is not resolvable here' : false }, async () => {
+  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
 
   const base = await makeFixture()
   try {
@@ -326,9 +402,8 @@ test('wrapping the live provider binds the extra directories per session', { ski
       sessions: { get: (id) => [inside, outside].find((session) => session.id === id) },
     })
 
-    const service = new ExtraWritableDirsService(ctx, serviceConfig(ExtraWritableDirsService.Config, {
-      extraWritableDirs: [extra],
-      presetName: 'workspace-write-extra',
+    const service = new ExtraSandboxPresetsService(ctx, serviceConfig(ExtraSandboxPresetsService.Config, {
+      presets: { 'workspace-write-extra': { writableDirs: [extra] } },
     }))
     await service.ready()
 
@@ -365,12 +440,12 @@ test('wrapping the live provider binds the extra directories per session', { ski
 })
 
 test('a mounted service without the expected seam is reported, not silently ignored', { skip }, async () => {
-  const { ExtraWritableDirsService } = await import('../lib/service.mjs')
+  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
 
   const warnings = []
   // Both enforcement services are mounted but neither exposes the interface the
   // plugin extends, which is what a harness upgrade that moved the seam looks
-  // like. The plugin must say so rather than leaving the preset quietly narrow.
+  // like. The plugin must say so rather than leaving the presets quietly narrow.
   const { ctx } = fakeContext({
     fs: { resolve: async (path) => ({ displayPath: path, targetKey: path }) },
     sandbox: { restrict: () => 'not the seam' },
@@ -379,9 +454,8 @@ test('a mounted service without the expected seam is reported, not silently igno
   })
   ctx.logger.warn = (message) => warnings.push(message)
 
-  new ExtraWritableDirsService(ctx, serviceConfig(ExtraWritableDirsService.Config, {
-    extraWritableDirs: [],
-    presetName: 'workspace-write-extra',
+  new ExtraSandboxPresetsService(ctx, serviceConfig(ExtraSandboxPresetsService.Config, {
+    presets: { rust: { writableDirs: [] } },
   }))
 
   assert.equal(warnings.length, 2, warnings.join('\n'))
@@ -398,9 +472,8 @@ test('a mounted service without the expected seam is reported, not silently igno
     systemPrompt: { getContextOrder: () => 110, context: () => {} },
   })
   again.ctx.logger.warn = (message) => warnings.push(message)
-  const service = new ExtraWritableDirsService(again.ctx, serviceConfig(ExtraWritableDirsService.Config, {
-    extraWritableDirs: ['/nonexistent-probe-dir'],
-    presetName: 'workspace-write-extra',
+  const service = new ExtraSandboxPresetsService(again.ctx, serviceConfig(ExtraSandboxPresetsService.Config, {
+    presets: { rust: { writableDirs: ['/nonexistent-probe-dir'] } },
   }))
   await service.ready()
   await service.ready()
@@ -409,7 +482,7 @@ test('a mounted service without the expected seam is reported, not silently igno
 })
 
 test('a recognized service is wrapped without any warning', { skip }, async () => {
-  const { ExtraWritableDirsService } = await import('../lib/service.mjs')
+  const { ExtraSandboxPresetsService } = await import('../lib/service.mjs')
 
   const warnings = []
   const { ctx } = fakeContext({
@@ -420,9 +493,8 @@ test('a recognized service is wrapped without any warning', { skip }, async () =
   })
   ctx.logger.warn = (message) => warnings.push(message)
 
-  const service = new ExtraWritableDirsService(ctx, serviceConfig(ExtraWritableDirsService.Config, {
-    extraWritableDirs: [],
-    presetName: 'workspace-write-extra',
+  const service = new ExtraSandboxPresetsService(ctx, serviceConfig(ExtraSandboxPresetsService.Config, {
+    presets: {},
   }))
   assert.deepEqual(warnings, [], warnings.join('\n'))
   await service.ready()

@@ -45,12 +45,11 @@ test('withExtraBinds inserts the binds with the profile, before --', () => {
   assert.deepEqual(original, ['bwrap', '--', 'bash'])
 })
 
-test('the fence wrapper widens only a workspace-write containment denial', async () => {
+test('the fence wrapper widens a containment denial in any confined mode', async () => {
   const denial = () => Object.assign(new Error('denied'), { code: 'FS_SANDBOX_DENIED' })
   // The target below resolves to `/outside/file.txt`, so this root contains it.
   const extra = ['/outside']
-  // The real service answers this; the stub mirrors its mode rule.
-  const rootsFor = (policy) => (policy?.mode === 'workspace-write' ? extra : [])
+  const rootsFor = () => extra
 
   // Denied, but the extra directories contain the target: allowed, and the
   // FRESH resolution is returned so the identity checked is the one written.
@@ -61,17 +60,22 @@ test('the fence wrapper widens only a workspace-write containment denial', async
     { displayPath: '/outside/file.txt', targetKey: '/outside/file.txt' },
   )
 
-  // read-only is never widened, even though the target lies in an extra root.
-  await assert.rejects(
-    fs.checkedTarget({ displayPath: '/outside/file.txt' }, { mode: 'read-only' }),
-    { code: 'FS_SANDBOX_DENIED' },
+  // `read-only` is widened too: the stock fence refuses before it resolves the
+  // target, so this is what makes a read-only preset able to grant directories.
+  assert.deepEqual(
+    await fs.checkedTarget({ displayPath: '/outside/file.txt' }, { mode: 'read-only' }),
+    { displayPath: '/outside/file.txt', targetKey: '/outside/file.txt' },
   )
 
-  // No extra directories apply: the stock denial stands.
+  // No extra directories apply: the stock denial stands in either mode.
   const noRoots = fakeFs(denial())
   applyExtraDirsFence(noRoots, () => [])
   await assert.rejects(
     noRoots.checkedTarget({ displayPath: '/outside/file.txt' }, { mode: 'workspace-write' }),
+    { code: 'FS_SANDBOX_DENIED' },
+  )
+  await assert.rejects(
+    noRoots.checkedTarget({ displayPath: '/outside/file.txt' }, { mode: 'read-only' }),
     { code: 'FS_SANDBOX_DENIED' },
   )
 
@@ -123,7 +127,7 @@ test('the fence wrapper widens only a workspace-write containment denial', async
   restore()
 })
 
-test('the confine wrapper binds only for workspace-write and reports other backends', async () => {
+test('the confine wrapper binds the reported directories and reports other backends', async () => {
   const argv = ['bwrap', '--ro-bind', '/', '/', '--bind', '/work', '/work', '--', 'bash', '-c', 'true']
 
   const unsupported = []
@@ -141,12 +145,16 @@ test('the confine wrapper binds only for workspace-write and reports other backe
   ])
   assert.deepEqual(unsupported, [])
 
-  // No extra directories: the stock argv is returned untouched.
-  assert.deepEqual((await sandbox.confine([], { mode: 'workspace-write' })).argv, argv)
+  // A read-only preset binds its directories the same way; the mode is not the
+  // plugin's business, the reported directories are.
+  assert.deepEqual(
+    (await sandbox.confine([], { mode: 'read-only', extra: ['/extra/a'] })).argv,
+    ['bwrap', '--ro-bind', '/', '/', '--bind', '/work', '/work', '--bind', '/extra/a', '/extra/a', '--', 'bash', '-c', 'true'],
+  )
 
-  // A non-workspace-write policy is never widened, even with the field set.
-  assert.deepEqual((await sandbox.confine([], { mode: 'read-only', extra: ['/x'] })).argv, argv)
-  assert.deepEqual((await sandbox.confine([], { mode: 'danger-full-access', extra: ['/x'] })).argv, argv)
+  // No extra directories: the stock argv is returned untouched, in any mode.
+  assert.deepEqual((await sandbox.confine([], { mode: 'workspace-write' })).argv, argv)
+  assert.deepEqual((await sandbox.confine([], { mode: 'read-only' })).argv, argv)
 
   // A non-bwrap rung warns once instead of pretending to widen.
   const other = fakeSandbox(['landlock', '--', 'bash'])

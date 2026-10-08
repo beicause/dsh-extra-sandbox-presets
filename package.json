@@ -1,8 +1,8 @@
 {
-  "name": "dsh-workspace-write-extra",
-  "version": "0.2.0",
+  "name": "dsh-extra-sandbox-presets",
+  "version": "0.3.0",
   "private": true,
-  "description": "Adds a fourth DSH permission preset, workspace-write-extra, that grants write access to configured extra directories on top of the session workspace. Linux bwrap only.",
+  "description": "Registers arbitrary configured DSH permission presets, each selecting a sandbox mode and approval policy plus the directories writable on top of it. Linux bwrap only.",
   "type": "module",
   "main": "lib/service.mjs",
   "exports": {

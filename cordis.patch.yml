@@ -1,11 +1,11 @@
-# dsh-workspace-write-extra bundle patch.
+# dsh-extra-sandbox-presets bundle patch.
 #
-# One row only. The plugin adds a fourth permission preset
-# (`workspace-write-extra`) and widens writes for the sessions that select it by
-# wrapping the two live enforcement services in place:
+# One row only. The plugin registers every preset in its own `presets` config
+# as a DSH permission preset and widens writes for the sessions that select one
+# by wrapping the two live enforcement services in place:
 #
 #   - the mounted filesystem's containment check gains a retry against the
-#     configured extra directories;
+#     directories the selected preset grants, in every confined mode;
 #   - the sandbox provider's `confine` gains the matching `--bind` pairs in the
 #     bwrap profile, so confined children agree with the write/edit tools.
 #
@@ -14,10 +14,12 @@
 # `sandbox` / `fs` service instances themselves stay exactly as shipped — which
 # is also why a failure to load this plugin degrades to stock behaviour instead
 # of leaving the harness without a filesystem or a sandbox.
+#
+# `presets` is deliberately empty here: the profile supplies the real table, so
+# this row only names the plugin and its defaults.
 
 - insert:
-    - id: workspace-write-extra
-      name: "dsh-workspace-write-extra"
+    - id: extra-sandbox-presets
+      name: "dsh-extra-sandbox-presets"
       config:
-        extraWritableDirs: []
-        presetName: workspace-write-extra
+        presets: {}
