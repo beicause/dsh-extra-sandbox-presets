@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { absoluteEntry, expandExtraDirs, isPathUnder, isUnderAny } from '../lib/roots.js'
+import { absoluteEntry, expandExtraDirs, isPathUnder, isUnderAny, workspaceEntryPath } from '../lib/roots.js'
 
 const withTempTree = async (run: (base: string) => Promise<unknown>) => {
   const base = await mkdtemp(join(tmpdir(), 'dsh-extra-dirs-'))
@@ -114,4 +114,72 @@ test('isUnderAny matches any configured root', async () => {
     assert.equal(await isUnderAny(join(base, 'elsewhere'), [one, two]), false)
     assert.equal(await isUnderAny(join(one, 'f'), []), false)
   })
+})
+
+test('a workspace: entry is kept as a subpath instead of being resolved', async () => {
+  await withTempTree(async (base) => {
+    const fixed = join(base, 'fixed')
+    await mkdir(fixed)
+
+    const { dirs, workspaceDirs, rejected } = await expandExtraDirs([
+      fixed,
+      'workspace:notes',
+      'workspace:./deep/nested',
+      'workspace:',
+      'workspace:.',
+    ])
+
+    // Only the absolute entry can be made real at configuration time.
+    assert.deepEqual(dirs, [fixed])
+    // The rest stay subpaths, in order, with '.' normalized away.
+    assert.deepEqual(workspaceDirs, ['notes', 'deep/nested', ''])
+    assert.deepEqual(rejected, [], 'a workspace entry is not a rejection')
+  })
+})
+
+test('a workspace: entry that cannot be a subpath is reported with its own reason', async () => {
+  await withTempTree(async (base) => {
+    const { dirs, workspaceDirs, rejected } = await expandExtraDirs([
+      'workspace:/etc',
+      'workspace:~/secrets',
+      'workspace:../escape',
+      'workspace:a/../../escape',
+      'workspace:ok',
+    ])
+
+    assert.deepEqual(dirs, [])
+    assert.deepEqual(workspaceDirs, ['ok'], 'only the usable subpath survives')
+    const reasons = rejected.map(({ reason }) => reason)
+    assert.equal(rejected.length, 4)
+    assert.ok(reasons.every((reason) => reason.startsWith('a workspace path')), reasons.join(' | '))
+    assert.ok(reasons.some((reason) => reason.includes('must be relative to the workspace')), reasons.join(' | '))
+    assert.ok(reasons.some((reason) => reason.includes('".."')), reasons.join(' | '))
+    assert.ok(reasons.some((reason) => reason.includes('a leading ~ does not apply')), reasons.join(' | '))
+  })
+})
+
+test('two spellings of one workspace directory are not bound twice', async () => {
+  const { workspaceDirs } = await expandExtraDirs([
+    'workspace:notes',
+    'workspace:./notes',
+    'workspace: notes ',
+    'workspace:other',
+  ])
+  assert.deepEqual(workspaceDirs, ['notes', 'other'])
+})
+
+test('workspaceDirs is empty when nothing is workspace-relative', async () => {
+  const { workspaceDirs } = await expandExtraDirs([])
+  assert.deepEqual(workspaceDirs, [])
+  const nonString = await expandExtraDirs([1, null, 'workspace-like'])
+  assert.deepEqual(nonString.workspaceDirs, [])
+})
+
+test('workspaceEntryPath joins a subpath onto a workspace root', () => {
+  assert.equal(workspaceEntryPath('notes', '/ws'), join('/ws', 'notes'))
+  assert.equal(workspaceEntryPath('deep/nested', '/ws'), join('/ws', 'deep/nested'))
+  // An empty subpath is the workspace root itself, not a stray separator.
+  assert.equal(workspaceEntryPath('', '/ws'), '/ws')
+  // The root is used as given: already absolute and canonical by contract.
+  assert.equal(workspaceEntryPath('notes', '/ws/'), join('/ws/', 'notes'))
 })

@@ -4,10 +4,14 @@
  * These run on a real Cordis application with the real prompt registry, which
  * `integration.test.ts` deliberately does not: its hand-built context inlines
  * every `inject` callback and drops it when a dependency is missing, so it can
- * never show that the waterfall listener fails to register on a live context.
- * That is exactly the failure this suite exists to catch — the plugin stays
- * mounted, its presets keep widening writes, and only the model-facing note
- * silently goes missing.
+ * never show that a registration fails to reach a live context.
+ *
+ * The distinction that matters here is between an assembled prompt and the one
+ * the model receives. The loop re-resolves every runtime context from its
+ * provider while preparing each request, so a contribution that exists only in
+ * the assembled copy — an amendment of another subsystem's entry, say — is
+ * replaced before it is ever rendered. Every case therefore reads the note
+ * through the same refresh the loop performs.
  *
  * Every case skips when the DSH packages are not resolvable, which is the case
  * outside an installed profile.
@@ -25,11 +29,14 @@ import { createHost, optionalImport, type Host } from './support/host.ts'
 const cordis = await optionalImport('@deepseek-ai/cordis')
 const skip = cordis === undefined ? 'the DSH packages are not resolvable here' : false
 
-/** The stock note the plugin amends in place. */
+/** The stock note the plugin's own context is read against. */
 const STOCK_NOTE = 'Current DSH file policy: workspace-write. Any available operation may modify files.'
 
 /** The prompt context `dsh-sandbox-policy` registers. */
 const POLICY_CONTEXT = 'sandbox:policy'
+
+/** The prompt context this plugin registers. */
+const NOTE_CONTEXT = 'sandbox:preset-write-dirs'
 
 /** Hosts whose stock policy context has been registered already. */
 const registeredHosts = new WeakSet<Host>()
@@ -45,11 +52,18 @@ const makeWritableDir = async (): Promise<string> => {
   return mkdtemp(join(parent, 'esp-prompt-'))
 }
 
+/** One assembled prompt context. */
+interface PromptContext {
+  name: string
+  text: string
+}
+
 /** The part of the prompt registry the cases read. */
 interface PromptRegistry {
   context(input: { name: string; order: number; text: (ctx: unknown) => string }): () => void
   getContextOrder(name: string): number
-  assemble(context: unknown): Promise<{ contexts: Array<{ name: string; text: string }> }>
+  assemble(context: unknown): Promise<{ contexts: PromptContext[] }>
+  refreshContext(assembly: { contexts: PromptContext[] }, context: unknown): { contexts: PromptContext[] }
 }
 
 /**
@@ -86,9 +100,8 @@ const mountService = async (options: {
 }
 
 /**
- * Register the stock policy context once, then read back the assembled text.
- * Registration is memoised per host because the registry rejects a duplicate
- * context name, and the cases assemble more than once.
+ * Register the stock policy context once. Registration is memoised per host
+ * because the registry rejects a duplicate context name.
  */
 const registerPolicyContext = (host: Host): void => {
   if (registeredHosts.has(host)) return
@@ -102,16 +115,36 @@ const registerPolicyContext = (host: Host): void => {
   registeredHosts.add(host)
 }
 
-/** Read the assembled policy text for one session. */
-const assemblePolicy = async (host: Host, session: unknown): Promise<string> => {
+/** The text of one context, or an empty string when it contributes none. */
+const textOf = (contexts: PromptContext[], name: string): string =>
+  contexts.find((entry) => entry.name === name)?.text ?? ''
+
+/**
+ * Read the plugin's note as the model would receive it.
+ *
+ * The assembled copy is taken first, then the same assembly is refreshed the
+ * way the loop does before each request. Both are returned so a case can pin
+ * that the note is in the refreshed result rather than only in the assembly.
+ *
+ * @param host - the mounted host.
+ * @param session - the session to assemble for.
+ * @returns the note text in each form.
+ */
+const assembleNote = async (host: Host, session: unknown): Promise<{ assembled: string; refreshed: string }> => {
   registerPolicyContext(host)
   const registry = host.ctx.get('systemPrompt') as PromptRegistry | undefined
   assert.ok(registry !== undefined, 'the prompt registry is reachable')
 
-  const assembly = await registry.assemble({ agent: { session } })
+  const context = { agent: { session } }
+  const assembly = await registry.assemble(context)
   const policy = assembly.contexts.find((entry) => entry.name === POLICY_CONTEXT)
   assert.ok(policy !== undefined, 'the stock policy context is in the assembly')
-  return policy.text
+  assert.equal(policy.text, STOCK_NOTE, 'the stock note is left exactly as its owner wrote it')
+
+  return {
+    assembled: textOf(assembly.contexts, NOTE_CONTEXT),
+    refreshed: textOf(registry.refreshContext(assembly, context).contexts, NOTE_CONTEXT),
+  }
 }
 
 test('the plugin registers its service on a real context', { skip }, async () => {
@@ -125,33 +158,67 @@ test('the plugin registers its service on a real context', { skip }, async () =>
   }
 })
 
-test('the note reaches the assembled prompt on a real context', { skip }, async () => {
+test('the note reaches the prompt the model receives', { skip }, async () => {
   const writable = await makeWritableDir()
   const { host, session } = await mountService({
     presets: { plus: { writableDirs: [writable] } },
     selected: () => 'plus',
   })
   try {
-    const text = await assemblePolicy(host, session)
-    assert.ok(text.startsWith(STOCK_NOTE), 'the stock wording is kept')
-    assert.match(text, /dsh-extra-sandbox-presets plugin additionally allows writing these configured directories/)
-    assert.ok(text.includes('"plus" preset'), 'the preset in force is named')
-    assert.ok(text.includes(`"${writable}"`), 'the granted directory is named in the prompt')
+    const { assembled, refreshed } = await assembleNote(host, session)
+    assert.match(assembled, /dsh-extra-sandbox-presets plugin additionally allows writing these configured directories/)
+    assert.ok(assembled.includes('"plus" preset'), 'the preset in force is named')
+    assert.ok(assembled.includes(`"${writable}"`), 'the granted directory is named in the prompt')
+    // This is the assertion the earlier implementation failed: the note only
+    // existed in the assembled copy, so the refreshed — and therefore rendered
+    // — prompt carried none of it.
+    assert.equal(refreshed, assembled, 'the note survives the per-request context refresh')
   } finally {
     await host.disposeAll()
     await rm(writable, { recursive: true, force: true })
   }
 })
 
-test('an unselected preset leaves the assembled prompt untouched', { skip }, async () => {
+test('switching the selected preset changes the refreshed note', { skip }, async () => {
+  const first = await makeWritableDir()
+  const second = await makeWritableDir()
+  let selected = 'plus'
+  const { host, session } = await mountService({
+    presets: {
+      plus: { writableDirs: [first] },
+      scratch: { sandbox: 'read-only', approval: 'ask', writableDirs: [second] },
+    },
+    selected: () => selected,
+  })
+  try {
+    const before = await assembleNote(host, session)
+    assert.equal(before.refreshed, before.assembled, 'the first selection survives the refresh')
+    assert.ok(before.refreshed.includes(`"${first}"`), 'the first preset grants the first directory')
+    assert.doesNotMatch(before.refreshed, new RegExp(`"${second}"`), 'and not the other one')
+
+    selected = 'scratch'
+    const after = await assembleNote(host, session)
+    assert.equal(after.refreshed, after.assembled, 'the new selection survives the refresh too')
+    assert.match(after.refreshed, /"scratch" preset/, 'the preset now in force is named')
+    assert.ok(after.refreshed.includes(`"${second}"`), 'the newly granted directory is named')
+    assert.doesNotMatch(after.refreshed, new RegExp(`"${first}"`), 'the directory it no longer grants is gone')
+  } finally {
+    await host.disposeAll()
+    await rm(first, { recursive: true, force: true })
+    await rm(second, { recursive: true, force: true })
+  }
+})
+
+test('an unselected preset contributes no note', { skip }, async () => {
   const { host, session } = await mountService({
     presets: { plus: { writableDirs: [await makeWritableDir()] } },
     // A shipped preset this plugin did not configure.
     selected: () => 'workspace-write',
   })
   try {
-    const text = await assemblePolicy(host, session)
-    assert.equal(text, STOCK_NOTE, 'no note is appended for a preset this plugin does not own')
+    const { assembled, refreshed } = await assembleNote(host, session)
+    assert.equal(assembled, '', 'no note for a preset this plugin does not own')
+    assert.equal(refreshed, '', 'and none after the refresh either')
   } finally {
     await host.disposeAll()
   }
@@ -165,8 +232,9 @@ test('an unusable directory is never named in the prompt', { skip }, async () =>
     selected: () => 'plus',
   })
   try {
-    const text = await assemblePolicy(host, session)
-    assert.equal(text, STOCK_NOTE, 'a directory that does not resolve is never named')
+    const { assembled, refreshed } = await assembleNote(host, session)
+    assert.equal(assembled, '', 'a directory that does not resolve is never named')
+    assert.equal(refreshed, '', 'nor after the refresh')
   } finally {
     await host.disposeAll()
   }
@@ -195,35 +263,38 @@ test('a read-only preset states its exception against the read-only boundary', {
     selected: () => 'scratch',
   })
   try {
-    const text = await assemblePolicy(host, session)
-    assert.ok(text.includes(`"${writable}"`), 'the granted directory is named')
-    assert.ok(text.includes('"scratch" preset'), 'the read-only preset is named')
-    assert.match(text, /even under the read-only policy above/)
+    const { assembled } = await assembleNote(host, session)
+    assert.ok(assembled.includes(`"${writable}"`), 'the granted directory is named')
+    assert.ok(assembled.includes('"scratch" preset'), 'the read-only preset is named')
+    assert.match(assembled, /even under the read-only policy above/)
   } finally {
     await host.disposeAll()
     await rm(writable, { recursive: true, force: true })
   }
 })
 
-test('unloading the plugin drops its listener from the live waterfall', { skip }, async () => {
+test('unloading the plugin removes its note from the prompt', { skip }, async () => {
   const writable = await makeWritableDir()
   const { host, session, mounted } = await mountService({
     presets: { plus: { writableDirs: [writable] } },
     selected: () => 'plus',
   })
   try {
-    assert.match(await assemblePolicy(host, session), /dsh-extra-sandbox-presets plugin additionally allows writing/)
+    assert.match((await assembleNote(host, session)).refreshed, /dsh-extra-sandbox-presets plugin additionally allows writing/)
 
-    // The handler must be torn down with the plugin, or a reload would append
-    // the note once per remaining listener. Unloading goes through the plugin
-    // handle Cordis returns, which is what the Loader disposes on reload.
+    // The registration has to go with the plugin, or a reload would leave a
+    // context behind that keeps naming directories nothing grants. Unloading
+    // goes through the handle Cordis returns, which the Loader disposes on
+    // reload.
     const handle = mounted as { dispose?: () => void | Promise<void> } | undefined
     assert.ok(handle !== undefined, 'the plugin returns a handle')
     await handle.dispose?.()
     await host.settle(300)
 
     assert.equal(host.ctx.get('sandboxPresets'), undefined, 'the service is unregistered')
-    assert.equal(await assemblePolicy(host, session), STOCK_NOTE, 'the waterfall listener is gone with it')
+    const { assembled, refreshed } = await assembleNote(host, session)
+    assert.equal(assembled, '', 'the context registration is gone with the plugin')
+    assert.equal(refreshed, '', 'and so is the note the model would receive')
   } finally {
     await host.disposeAll()
     await rm(writable, { recursive: true, force: true })

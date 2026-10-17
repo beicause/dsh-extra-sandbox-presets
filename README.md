@@ -58,22 +58,29 @@ The model-facing note needs the same correction, because the stock
 `sandbox:policy` note is rendered from the mode alone: under `read-only` it
 states that nothing may be modified, and under `workspace-write` it names only
 the workspace, while a selected preset may in fact make further directories
-writable. The plugin therefore listens on the `system-prompt/assemble`
-waterfall and appends the granted directories to that note **in place**. In both
-confined modes the note reads as a closed boundary, so the appended sentence
-states the exception outright instead of relying on "additionally" alone to be
-read as an override of the sentence before it: under `read-only` it says the
-directories are writable *even under the read-only policy above* (the stock
-sentence reads as a flat prohibition), and under `workspace-write` it says they
-are writable *whether or not they are inside the session workspace* (the stock
-sentence names only that path and reads as the whole writable area). A
-`danger-full-access` preset leaves the note untouched: that mode already
-restricts nothing, so "additionally writable directories" would be a false
-statement rather than a correction. A
-second context of its own would have been simpler, but it would sit next to a
-stock sentence it contradicts; a context registered under the same name is not
-an option either, since the system-prompt service keys contexts by name within
-one layer and rejects a duplicate.
+writable. The plugin therefore registers **a runtime context of its own**, right
+after the stock note, naming the directories the selected preset grants. In both
+confined modes the note reads as a closed boundary, so the sentence states the
+exception outright instead of relying on "additionally" alone to be read as an
+override of the sentence before it: under `read-only` it says the directories are
+writable *even under the read-only policy above* (the stock sentence reads as a
+flat prohibition), and under `workspace-write` it says they are writable *whether
+or not they are inside the session workspace* (the stock sentence names only that
+path and reads as the whole writable area). A `danger-full-access` preset
+contributes nothing: that mode already restricts nothing, so "additionally
+writable directories" would be a false statement rather than a correction.
+
+The note is a context of its own rather than an amendment of the stock one, and
+that distinction is what makes it reach the model. The agent loop re-resolves
+every runtime context **from its registered provider** while preparing each
+request, then logs the result as the snapshot the next step reads. A copy of
+another subsystem's entry that this plugin rewrote in the
+`system-prompt/assemble` waterfall is therefore present in a direct `assemble()`
+call and absent from every real step — the provider's own text replaces it. A
+provider of this plugin's own survives that refresh, and re-rendering from the
+live selection is what makes the note follow a preset switch. Registering under
+the stock name is not an option either, since the system-prompt service keys
+contexts by name within one layer and rejects a duplicate.
 
 Two consequences follow, and both matter:
 
@@ -137,6 +144,29 @@ expansion. A preset whose `sandbox` or `approval` is not one of the values above
 is likewise refused with a warning instead of being published, as are the
 reserved names `custom` and `auto`.
 
+An entry prefixed with `workspace:` names a path **relative to the session
+workspace**, and is resolved separately for each session:
+
+```yaml
+workspace-write-extra:
+  writableDirs:
+    - /srv/shared-assets
+    - workspace:notes        # <session workspace>/notes
+    - workspace:cargo/target # <session workspace>/cargo/target
+```
+
+A directory below the workspace is resolved per call, against the root the
+harness folds for the calling session, rather than once while the plugin loads:
+the workspace belongs to the session, and the plugin does not know it yet at
+that point. One entry therefore means the same thing in every session, and the
+model-facing note names the real path.
+
+A `workspace:` entry must be relative — `workspace:/etc` and `workspace:~/x` are
+refused with a warning — and may not contain `..`, which is refused rather than
+silently clamped so a configuration cannot escape the workspace. A directory
+below the workspace that does not exist yet is still granted: the path is only
+compared, and the bwrap profile skips a bind source that is missing.
+
 `writableDirs` only has an effect under a confined mode. A preset selecting
 `danger-full-access` may list them — they stay visible in the table — but that
 mode confines nothing, so they grant nothing extra and the model-facing note is
@@ -168,7 +198,7 @@ preset in production.
 | `sandbox.confine(argv, policy, signal)` resolves to an object carrying `argv` | `src/provider.ts` |
 | Policy fields `mode` and `sessionId`; result field `argv` | both wrappers |
 | `permissionPresets.presets` and `emitCatalogChanged()` | `src/service.ts` |
-| The `system-prompt/assemble` waterfall, and a `sandbox:policy` context to correct in it | `src/service.ts` |
+| The prompt registry, and a `sandbox:policy` context to place the note beside | `src/service.ts` |
 
 Two properties keep this robust across upgrades:
 
@@ -197,7 +227,7 @@ logged warning and stock behaviour — never a missing filesystem or sandbox.
 
 | File | Role |
 | --- | --- |
-| `src/service.ts` | `ctx.sandboxPresets`: owns the configured preset table, decides per session which preset applies, wraps the two enforcement services, publishes the presets, and corrects the stock sandbox note on the assembly waterfall. |
+| `src/service.ts` | `ctx.sandboxPresets`: owns the configured preset table, decides per session which preset applies, resolves `workspace:` entries against the calling session, wraps the two enforcement services, publishes the presets, and registers the model-facing note beside the stock sandbox note. |
 | `src/presets.ts` | Normalizes the configured table and expands each preset's directories. |
 | `src/fs.ts` | Wraps the live filesystem's containment check. |
 | `src/provider.ts` | Wraps the live sandbox provider's `confine`. |
@@ -226,7 +256,8 @@ pnpm run typecheck  # tsc -p tsconfig.json (src + test)
 ## Tests
 
 ```
-node --test test/
+pnpm test                        # node --test test/*.test.ts
+node scripts/require-no-skips.mjs # same run, failing on any skip
 ```
 
 `src/roots.ts`, `src/plan.ts`, `src/presets.ts`, and the two wrappers are

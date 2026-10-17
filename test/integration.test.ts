@@ -146,6 +146,53 @@ function fakeContext(services: Record<string, unknown> = {}): {
 /** The plugin accepts any context it is handed; the stand-in is close enough. */
 const asContext = (ctx: FakeContext): Context => ctx as unknown as Context
 
+/** The context orders the real prompt registry assigns, copied from the harness. */
+const CONTEXT_ORDERS: Record<string, number> = {
+  WORKING_DIRECTORY: 100,
+  SANDBOX_POLICY: 110,
+  APPROVAL_POLICY: 115,
+  SUBAGENT_DELEGATION: 120,
+  TEAM_IDENTITY: 125,
+  HARNESS_SOURCE: 200,
+  WEB_SURFACE: 210,
+}
+
+/** The prompt context this plugin registers. */
+const NOTE_CONTEXT = 'sandbox:preset-write-dirs'
+
+/** The part of the prompt registry this suite stands in for. */
+interface PromptRegistryShape {
+  contexts: Array<{ name: string; order: number; text: (ctx: unknown) => string }>
+  context(input: { name: string; order: number; text: (ctx: unknown) => string }): void
+  getContextOrder(name: string): number
+  render(session: unknown): string
+}
+
+/**
+ * A stand-in for the prompt registry. It records what the plugin registers and
+ * renders the note the way the harness would, so a case reads the model-facing
+ * text rather than inspecting a registration call.
+ *
+ * A registration — not a rewrite of another subsystem's entry — is what the
+ * harness keeps: it re-resolves every runtime context from its provider while
+ * preparing each request, so only the registered text reaches the model.
+ */
+const promptRegistry = (): PromptRegistryShape => {
+  const contexts: PromptRegistryShape['contexts'] = []
+  return {
+    contexts,
+    context(input) {
+      assert.ok(!contexts.some((entry) => entry.name === input.name), `no duplicate context "${input.name}"`)
+      contexts.push(input)
+    },
+    getContextOrder: (name: string) => CONTEXT_ORDERS[name] ?? 0,
+    /** The note this plugin contributes for one session. */
+    render(session: unknown): string {
+      return contexts.find((entry) => entry.name === NOTE_CONTEXT)?.text({ agent: { session } }) ?? ''
+    },
+  }
+}
+
 test('every configured preset is published in the permission table and catalog', { skip }, async () => {
   const { ExtraSandboxPresetsService } = await import('../lib/service.js')
 
@@ -161,9 +208,10 @@ test('every configured preset is published in the permission table and catalog',
     },
     emitCatalogChanged: () => { catalogChanged.push(1) },
   }
-  const { ctx, listeners } = fakeContext({
+  const prompt = promptRegistry()
+  const { ctx } = fakeContext({
     permissionPresets: permissions,
-    systemPrompt: {},
+    systemPrompt: prompt,
   })
 
   const service = new ExtraSandboxPresetsService(asContext(ctx), serviceConfig(ExtraSandboxPresetsService.Config, {
@@ -183,21 +231,14 @@ test('every configured preset is published in the permission table and catalog',
   assert.deepEqual(permissions.presets['read-only'], { sandbox: 'read-only', approval: 'ask' })
   assert.equal(catalogChanged.length, 1)
 
-  // The plugin listens on the assembly waterfall instead of registering a
-  // second context, which would contradict the stock read-only wording.
-  const waterfall = listeners.get('system-prompt/assemble')
-  assert.ok(waterfall !== undefined && waterfall.length === 1, 'the assembly waterfall is listened on')
-  const listener = waterfall[0]
-  const stockNote = 'Current DSH file policy: workspace-write. Any available operation may modify files.'
-  let nextCalls = 0
-  // No session resolves here, so the assembly must pass through untouched.
-  const assembled = await listener(
-    { contexts: [{ name: 'sandbox:policy', text: stockNote }] },
-    { agent: { session: undefined } },
-    async () => { nextCalls += 1; return { contexts: [{ name: 'sandbox:policy', text: stockNote }] } },
-  ) as { contexts: Array<{ name: string; text: string }> }
-  assert.equal(nextCalls, 1, 'the next link of the waterfall still runs')
-  assert.deepEqual(assembled.contexts, [{ name: 'sandbox:policy', text: stockNote }])
+  // The plugin registers a context of its own rather than rewriting the stock
+  // note: the harness re-resolves contexts from their providers on every
+  // request, so only a registration survives to the rendered prompt.
+  assert.equal(prompt.contexts.length, 1, 'exactly one context is registered')
+  assert.equal(prompt.contexts[0].name, NOTE_CONTEXT)
+  assert.equal(prompt.contexts[0].order, CONTEXT_ORDERS.SANDBOX_POLICY + 1, 'it sits directly after the stock note')
+  // No session resolves here, so the context contributes nothing.
+  assert.equal(prompt.render(undefined), '', 'no session means no note')
 
   // A reserved name is refused instead of shadowing the shipped presets.
   const reserved = fakeContext({ permissionPresets: permissions }).ctx
@@ -269,11 +310,12 @@ test('each preset grants only its own directories, and only to its own session',
     // The permission projection is the only thing deciding enablement.
     let selected = 'workspace-write'
     const session = { id: 'session-1' }
-    const { ctx, listeners } = fakeContext({
+    const prompt = promptRegistry()
+    const { ctx } = fakeContext({
       permissionPresets: { presets: {}, emitCatalogChanged() {} },
       sessionProjections: { stateOf: () => ({ preset: selected }) },
       sessions: { get: (id: string) => (id === session.id ? session : undefined) },
-      systemPrompt: {},
+      systemPrompt: prompt,
     })
 
     const service = new ExtraSandboxPresetsService(asContext(ctx), serviceConfig(ExtraSandboxPresetsService.Config, {
@@ -295,20 +337,9 @@ test('each preset grants only its own directories, and only to its own session',
     assert.deepEqual(service.rootsFor(session), [workspaceExtra])
     assert.deepEqual(service.rootsForSessionId('session-1'), [workspaceExtra])
 
-    // The stock sandbox note is corrected in place, naming those directories.
-    const listener = listeners.get('system-prompt/assemble')?.[0]
-    assert.ok(listener !== undefined, 'the assembly waterfall is listened on')
-    const stockNote = 'Current DSH file policy: workspace-write. Some platform temporary areas may also be writable.'
-    const assemble = async () => {
-      const assembled = await listener(
-        { contexts: [{ name: 'sandbox:policy', text: stockNote }] },
-        { agent: { session } },
-        async () => ({ contexts: [{ name: 'sandbox:policy', text: stockNote }] }),
-      ) as { contexts: Array<{ name: string; text: string }> }
-      return assembled.contexts[0].text
-    }
-    const widened = await assemble()
-    assert.ok(widened.startsWith(stockNote), 'the stock wording is kept')
+    // The plugin's own context names the directories the selected preset grants.
+    const noteFor = (): string => prompt.render(session)
+    const widened = noteFor()
     assert.match(widened, /dsh-extra-sandbox-presets plugin additionally allows writing these configured directories/)
     // The preset that grants the directories is named, so a session with more
     // than one configured preset can tell which one is in force.
@@ -323,16 +354,17 @@ test('each preset grants only its own directories, and only to its own session',
     selected = 'scratch'
     assert.deepEqual(service.rootsFor(session), [scratch])
     assert.deepEqual(service.dirsForPreset('workspace-write-extra'), [workspaceExtra])
-    const readOnlyNote = await assemble()
+    const readOnlyNote = noteFor()
     assert.ok(readOnlyNote.includes(`"${scratch}"`), 'the note follows the selected preset')
     assert.ok(readOnlyNote.includes('"scratch" preset'), 'the newly selected preset is named')
     assert.doesNotMatch(readOnlyNote, /"workspace-write-extra" preset/, 'the previous preset is no longer named')
     // This preset is read-only, so the exception is stated outright.
     assert.match(readOnlyNote, /even under the read-only policy above/)
 
-    // A session that selects nothing gets the untouched stock note.
+    // A session that selects nothing contributes no note, so the stock wording
+    // is what the model sees.
     selected = 'read-only'
-    assert.equal(await assemble(), stockNote)
+    assert.equal(noteFor(), '')
 
     // Unknown, absent, and non-configured selections get nothing.
     selected = 'read-only'
@@ -355,11 +387,12 @@ test('an unconfined preset never amends the stock note', { skip }, async () => {
 
     const selected = 'wide'
     const session = { id: 'session-1' }
-    const { ctx, listeners } = fakeContext({
+    const prompt = promptRegistry()
+    const { ctx } = fakeContext({
       permissionPresets: { presets: {}, emitCatalogChanged() {} },
       sessionProjections: { stateOf: () => ({ preset: selected }) },
       sessions: { get: (id: string) => (id === session.id ? session : undefined) },
-      systemPrompt: {},
+      systemPrompt: prompt,
     })
 
     const service = new ExtraSandboxPresetsService(asContext(ctx), serviceConfig(ExtraSandboxPresetsService.Config, {
@@ -371,18 +404,9 @@ test('an unconfined preset never amends the stock note', { skip }, async () => {
     // directories are known; nothing confines, so they grant nothing extra.
     assert.equal(service.presetFor(session)?.name, 'wide')
 
-    const listener = listeners.get('system-prompt/assemble')?.[0]
-    assert.ok(listener !== undefined)
-    const stockNote = 'Current DSH file policy: danger-full-access. The DSH file sandbox does not restrict file modifications by available operations.'
-    const assembled = await listener(
-      { contexts: [{ name: 'sandbox:policy', text: stockNote }] },
-      { agent: { session } },
-      async () => ({ contexts: [{ name: 'sandbox:policy', text: stockNote }] }),
-    ) as { contexts: Array<{ name: string; text: string }> }
-
     // `danger-full-access` already allows every path, so a sentence about
-    // "additionally" would be wrong: the note must be left exactly as shipped.
-    assert.equal(assembled.contexts[0].text, stockNote)
+    // "additionally" would be wrong: the plugin must contribute nothing.
+    assert.equal(prompt.render(session), '', 'no note is contributed under an unconfined mode')
 
     // The enforcement policy is unconfined too: `extraRootsFor` stays empty so
     // neither wrapper loosens anything.
@@ -392,6 +416,72 @@ test('an unconfined preset never amends the stock note', { skip }, async () => {
   }
 })
 
+test('a workspace entry resolves against the workspace of each session', { skip }, async () => {
+  const { ExtraSandboxPresetsService } = await import('../lib/service.js')
+
+  const base = await makeFixture()
+  try {
+    // Two sessions with different workspaces, as the harness folds them from
+    // each session's own cwd. One workspace entry has to name a different real
+    // directory in each, which a load-time expression could never do.
+    const one = join(base, 'ws-one')
+    const two = join(base, 'ws-two')
+    const outside = join(base, 'fixed')
+    await mkdir(join(one, 'notes'), { recursive: true })
+    await mkdir(join(two, 'notes'), { recursive: true })
+    await mkdir(outside)
+
+    const first = { id: 'first', header: { cwd: one } }
+    const second = { id: 'second', header: { cwd: two } }
+    const prompt = promptRegistry()
+    const { ctx } = fakeContext({
+      permissionPresets: { presets: {}, emitCatalogChanged() {} },
+      sessionProjections: { stateOf: () => ({ preset: 'plus' }) },
+      sessions: { get: (id: string) => [first, second].find((session) => session.id === id) },
+      // The stock policy resolves a session's workspace boundary for the
+      // enforcement layers; the plugin reads the same value it reports.
+      sandboxPolicy: {
+        resolve: (request: { session?: { header?: { cwd?: string } } }) => ({
+          mode: 'workspace-write',
+          workspaceRoot: request.session?.header?.cwd,
+        }),
+      },
+      systemPrompt: prompt,
+    })
+
+    const service = new ExtraSandboxPresetsService(asContext(ctx), serviceConfig(ExtraSandboxPresetsService.Config, {
+      presets: { plus: { writableDirs: [outside, 'workspace:notes'] } },
+    }))
+    await service.ready()
+
+    // The fixed directory is shared; the workspace entry is not.
+    assert.deepEqual(service.rootsFor(first), [outside, join(one, 'notes')])
+    assert.deepEqual(service.rootsFor(second), [outside, join(two, 'notes')])
+
+    // The enforcement path resolves the same way, from the per-call policy.
+    assert.deepEqual(
+      service.extraRootsFor({ mode: 'workspace-write', sessionId: 'first', workspaceRoot: one }),
+      [outside, join(one, 'notes')],
+    )
+    assert.deepEqual(
+      service.extraRootsFor({ mode: 'workspace-write', sessionId: 'second', workspaceRoot: two }),
+      [outside, join(two, 'notes')],
+    )
+
+    // The model is told the real path, so it can name a directory it can use.
+    const note = prompt.render(first)
+    assert.ok(note.includes(join(one, 'notes')), note)
+    assert.ok(!note.includes(join(two, 'notes')), 'the other session\'s path is not named')
+
+    // An unconfined mode still grants nothing, workspace entry or not.
+    assert.deepEqual(
+      service.extraRootsFor({ mode: 'danger-full-access', sessionId: 'first', workspaceRoot: one }),
+      [],
+    )
+  } finally {
+    await rm(base, { recursive: true, force: true })
+  }
+})
 test('an unusable configured directory is ignored, never granted', { skip }, async () => {
   const { ExtraSandboxPresetsService } = await import('../lib/service.js')
 

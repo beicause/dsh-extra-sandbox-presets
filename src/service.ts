@@ -32,6 +32,8 @@ import { Service, type Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { applyExtraDirsFence } from './fs.js'
 import { applyExtraDirsConfine } from './provider.js'
+import { isAbsolute } from 'node:path'
+import { workspaceEntryPath } from './roots.js'
 import {
   APPROVAL_POLICIES,
   DEFAULT_APPROVAL,
@@ -68,6 +70,22 @@ export interface SandboxPresetsConfig {
 interface ResolvedPolicy {
   readonly mode?: unknown
   readonly sessionId?: unknown
+  readonly workspaceRoot?: unknown
+}
+
+/** The parts of a session this plugin reads to find its workspace. */
+interface SessionLike {
+  readonly id?: unknown
+  readonly header?: { readonly cwd?: unknown }
+}
+
+/**
+ * The sandbox policy service, read only to recover the workspace root the
+ * harness folds for a session. Resolving through the service keeps this
+ * plugin's workspace boundary identical to the one the stock policy states.
+ */
+interface SandboxPolicyHost {
+  resolve?(request: { session?: unknown; mode?: unknown }): { workspaceRoot?: unknown } | undefined
 }
 
 /** The permission service surface this plugin publishes into. */
@@ -79,33 +97,30 @@ interface PermissionTableHost {
 }
 
 /**
- * The stock sandbox policy note this plugin restates. It is owned by
- * `@deepseek-ai/dsh-sandbox-policy`, which registers it at
- * `CONTEXT_ORDERS.SANDBOX_POLICY` and does not export its renderer, so the
- * note is corrected in place rather than replaced by a second context.
+ * This plugin's own runtime-context entry, placed directly after the stock
+ * sandbox policy note.
+ *
+ * It is a context of its own rather than an amendment of that note. The loop
+ * re-resolves every context from its provider while preparing each request, so
+ * a copy of another subsystem's entry that this plugin rewrote in the assembly
+ * waterfall is replaced by the provider's own text before the snapshot reaches
+ * the model: the note would be present in a direct `assemble()` and absent
+ * from every real step. A provider of this plugin's own is re-resolved from the
+ * live selection instead, so switching presets shows up in the next snapshot.
  */
-const POLICY_CONTEXT = 'sandbox:policy'
+const NOTE_CONTEXT = 'sandbox:preset-write-dirs'
 
-/** The part of an assembled prompt this plugin rewrites. */
-interface PromptAssembly {
-  contexts: Array<{ name: string; text: string }>
-}
+/** The registry placement name of the stock sandbox policy note. */
+const POLICY_PLACEMENT = 'SANDBOX_POLICY'
 
-/**
- * The system-prompt waterfall this plugin listens on. The event belongs to
- * `@deepseek-ai/dsh-system-prompt`, which is not a dependency here, so only
- * the shape this plugin touches is declared.
- */
-interface AssembleHost {
-  on(
-    name: 'system-prompt/assemble',
-    listener: (
-      assembly: PromptAssembly,
-      context: { agent?: { session?: unknown } },
-      next: () => Promise<PromptAssembly>,
-    ) => Promise<PromptAssembly>,
-    options?: { prepend?: boolean },
-  ): unknown
+/** The prompt registry this plugin registers its note with. */
+interface PromptRegistry {
+  context(input: {
+    name: string
+    order: number
+    text: (context: { agent?: { session?: unknown } }) => string
+  }): unknown
+  getContextOrder(name: string): number
 }
 /** One rejection reported to the operator, from either normalization stage. */
 interface ReportableRejection {
@@ -117,6 +132,22 @@ interface ReportableRejection {
 
 const isPermissionTableHost = (value: unknown): value is PermissionTableHost =>
   typeof value === 'object' && value !== null && typeof (value as PermissionTableHost).presets === 'object'
+
+/**
+ * The workspace root one resolved policy carries. The enforcing services
+ * receive the resolved policy, so its own root is preferred over re-resolving;
+ * the session's cwd is the fallback for a partial policy.
+ *
+ * @param policy - the resolved per-call policy.
+ * @param session - the session the call belongs to, when one was found.
+ * @returns the absolute workspace root, or `undefined` when neither carries one.
+ */
+const workspaceRootOf = (policy: ResolvedPolicy, session: SessionLike | undefined): string | undefined => {
+  const own = policy.workspaceRoot
+  if (typeof own === 'string' && isAbsolute(own)) return own
+  const cwd = session?.header?.cwd
+  return typeof cwd === 'string' && isAbsolute(cwd) ? cwd : undefined
+}
 
 export class ExtraSandboxPresetsService extends Service {
   static Config = z.object({
@@ -146,6 +177,9 @@ export class ExtraSandboxPresetsService extends Service {
 
   /** Canonical directories per preset name. */
   private _dirs = new Map<string, string[]>()
+
+  /** Workspace subpaths per preset name, resolved against a session's workspace. */
+  private _workspace = new Map<string, string[]>()
 
   /** Comparison key of the table the current snapshot came from. */
   private _key: string | undefined = undefined
@@ -187,7 +221,13 @@ export class ExtraSandboxPresetsService extends Service {
     const resolved = policy as ResolvedPolicy | undefined
     if (resolved === undefined || resolved === null) return []
     if (resolved.mode === UNCONFINED_MODE) return []
-    return this.rootsForSessionId(resolved.sessionId)
+    this._refresh()
+    const sessionId = resolved.sessionId
+    if (sessionId === undefined || sessionId === null) return []
+    const session = this.ctx.get('sessions')?.get?.(sessionId) as SessionLike | undefined
+    const entry = session === undefined ? undefined : this.presetFor(session)
+    if (entry === undefined) return []
+    return this.resolvedDirsFor(entry.name, workspaceRootOf(resolved, session))
   }
 
   /**
@@ -292,6 +332,28 @@ export class ExtraSandboxPresetsService extends Service {
   }
 
   /**
+   * Every directory one configured preset grants, with its workspace-relative
+   * entries resolved against a workspace root.
+   *
+   * A workspace subpath is joined onto the root the caller supplies, which is
+   * the root the harness folded for that session — so a preset granting
+   * `workspace:notes/` means the same thing for every session, wherever its
+   * workspace is, instead of being pinned to whatever the process default was
+   * when the plugin loaded.
+   *
+   * @param presetName - one configured preset name.
+   * @param workspaceRoot - the workspace root of the calling session.
+   * @returns the canonical directories plus the resolved workspace entries.
+   */
+  resolvedDirsFor(presetName: string, workspaceRoot: string | undefined): readonly string[] {
+    const fixed = this.dirsForPreset(presetName)
+    const subpaths = this._workspace.get(presetName) ?? []
+    if (subpaths.length === 0 || workspaceRoot === undefined) return fixed
+    const resolved = subpaths.map((subpath) => workspaceEntryPath(subpath, workspaceRoot))
+    return [...fixed, ...resolved.filter((path) => !fixed.includes(path))]
+  }
+
+  /**
    * The canonical directories that apply to one call: the selected preset's
    * directories while a configured preset is selected, otherwise none.
    *
@@ -301,7 +363,27 @@ export class ExtraSandboxPresetsService extends Service {
   rootsFor(session: unknown): readonly string[] {
     this._refresh()
     const entry = this.presetFor(session)
-    return entry === undefined ? [] : this.dirsForPreset(entry.name)
+    if (entry === undefined) return []
+    return this.resolvedDirsFor(entry.name, this.workspaceRootFor(session as SessionLike | undefined))
+  }
+
+  /**
+   * The workspace root a session writes within, as the harness folds it.
+   *
+   * Read through the sandbox policy service so this plugin's boundary is the
+   * same one the stock `sandbox:policy` note names; a session's own `cwd` is
+   * the direct fallback when that service is unavailable.
+   *
+   * @param session - the calling session, or `undefined` for agentless calls.
+   * @returns the absolute workspace root, or `undefined` when none can be found.
+   */
+  private workspaceRootFor(session: SessionLike | undefined): string | undefined {
+    if (session === undefined || session === null) return undefined
+    const policy = this.ctx.get('sandboxPolicy') as SandboxPolicyHost | undefined
+    const resolved = policy?.resolve?.({ session })?.workspaceRoot
+    if (typeof resolved === 'string' && isAbsolute(resolved)) return resolved
+    const own = session.header?.cwd
+    return typeof own === 'string' && isAbsolute(own) ? own : undefined
   }
 
   /**
@@ -332,10 +414,11 @@ export class ExtraSandboxPresetsService extends Service {
     this._key = key
     this._presets = entries
     this._publish?.()
-    this._pending = expandPresetDirs(entries).then(({ roots, unusable }) => {
+    this._pending = expandPresetDirs(entries).then(({ roots, workspaceRoots, unusable }) => {
       // A newer configuration may have arrived while this expansion ran.
       if (this._key !== key) return
       this._dirs = roots
+      this._workspace = workspaceRoots
       this._report([...rejected, ...unusable])
     }, (error: unknown) => {
       this._warn(`expanding the configured writable directories failed: ${detailOf(error)}`)
@@ -430,50 +513,65 @@ export class ExtraSandboxPresetsService extends Service {
   }
 
   /**
-   * Correct the stock sandbox policy note so it accounts for the directories
-   * the session's selected preset adds. The stock note is written from the
-   * sandbox mode alone, so it reads as a closed boundary in both confined
-   * modes: under `read-only` it claims nothing is writable at all, and under
-   * `workspace-write` it names the session workspace as the writable area.
-   * The note is amended in place — a second context would contradict it.
+   * Register this plugin's own runtime-context entry, naming the directories
+   * the session's selected preset adds.
+   *
+   * The entry is rendered from the live selection on every assembly, so it
+   * follows a preset switch and survives the per-request context refresh that
+   * an amended copy of the stock note would not. It renders to an empty string
+   * unless a configured, confined preset is selected with at least one usable
+   * directory, and empty contexts are dropped from the snapshot, so no note
+   * appears where this plugin grants nothing.
    */
   private _publishContext(): void {
     this.ctx.inject(['systemPrompt'], (scope) => {
-      const assemble = scope as unknown as AssembleHost
-      if (typeof assemble.on !== 'function') return
-      assemble.on('system-prompt/assemble', async (assembly, context, next) => {
-        const assembled = await next()
-        const entry = this.presetFor(context.agent?.session)
-        if (entry === undefined || entry.sandbox === UNCONFINED_MODE) return assembled
-        const roots = this.dirsForPreset(entry.name)
-        if (roots.length === 0) return assembled
-        // The stock note reads as a closed boundary in both confined modes:
-        // under `read-only` it is a flat prohibition, and under
-        // `workspace-write` it names the session workspace as the writable
-        // area. The exception is stated outright in each case instead of
-        // relying on "additionally" to be read as an override of the sentence
-        // before it. `danger-full-access` returned above, so only confined
-        // modes reach the clause.
-        //
-        // The preset name is named because a configured preset is what grants
-        // the directories: when several are configured, the model has to know
-        // which one is in force to answer whether a path is writable. The
-        // injector is named so the note can be traced back to its source.
-        const note = `The ${name} plugin additionally allows writing these configured directories`
-          + ` while the "${entry.name}" preset is selected`
-          + exceptionClauseFor(entry.sandbox)
-          + ': '
-          + `${roots.map((root) => `"${root}"`).join(', ')}. `
-          + 'They apply only while that preset remains selected.'
-        return {
-          ...assembled,
-          contexts: assembled.contexts.map((entry) =>
-            entry.name === POLICY_CONTEXT && entry.text.length > 0
-              ? { ...entry, text: `${entry.text} ${note}` }
-              : entry),
-        }
+      const registry = (scope as unknown as { systemPrompt?: PromptRegistry }).systemPrompt
+      if (typeof registry?.context !== 'function') return
+      // Directly after the stock note, which states the boundary the exception
+      // is read against. Both orders come from the registry so a harness that
+      // moves the note keeps this entry beside it.
+      registry.context({
+        name: NOTE_CONTEXT,
+        order: registry.getContextOrder(POLICY_PLACEMENT) + 1,
+        text: (context) => this.noteFor(context?.agent?.session),
       })
     })
+  }
+
+  /**
+   * The model-facing note for one session, or an empty string when it grants
+   * nothing beyond what the stock policy note already describes.
+   *
+   * The stock note is written from the sandbox mode alone, so it reads as a
+   * closed boundary in both confined modes: under `read-only` it is a flat
+   * prohibition, and under `workspace-write` it names the session workspace as
+   * the writable area. The exception is therefore stated outright in each case
+   * rather than left to "additionally" to be read as an override of the
+   * sentence before it. `danger-full-access` never confines, so it is excluded
+   * and only confined modes reach the clause.
+   *
+   * The preset name is named because a configured preset is what grants the
+   * directories: when several are configured, the model has to know which one is
+   * in force to answer whether a path is writable. The injector is named so the
+   * note can be traced back to its source.
+   *
+   * @param session - the calling session, or `undefined` for agentless calls.
+   * @returns the note, or an empty string when no directory applies.
+   */
+  private noteFor(session: unknown): string {
+    this._refresh()
+    const entry = this.presetFor(session)
+    if (entry === undefined || entry.sandbox === UNCONFINED_MODE) return ''
+    // Workspace entries are named by the real path they resolve to for this
+    // session, so the model is told where the directories actually are.
+    const roots = this.resolvedDirsFor(entry.name, this.workspaceRootFor(session as SessionLike | undefined))
+    if (roots.length === 0) return ''
+    return `The ${name} plugin additionally allows writing these configured directories`
+      + ` while the "${entry.name}" preset is selected`
+      + exceptionClauseFor(entry.sandbox)
+      + ': '
+      + `${roots.map((root) => `"${root}"`).join(', ')}. `
+      + 'They apply only while that preset remains selected.'
   }
 }
 

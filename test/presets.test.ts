@@ -108,10 +108,12 @@ test('expandPresetDirs keeps each preset separate and reports the unusable entri
       rust: { writableDirs: [good, file] },
       scratch: { sandbox: 'read-only', writableDirs: [also, join(base, 'missing')] },
     })
-    const { roots, unusable } = await expandPresetDirs(entries)
+    const { roots, workspaceRoots, unusable } = await expandPresetDirs(entries)
 
     assert.deepEqual(roots.get('rust'), [good])
     assert.deepEqual(roots.get('scratch'), [also])
+    assert.deepEqual(workspaceRoots.get('rust'), [])
+    assert.deepEqual(workspaceRoots.get('scratch'), [])
     assert.deepEqual(unusable.map(({ name }) => name), ['rust', 'scratch'])
     assert.match(unusable[0].reason, /not a directory/)
     assert.match(unusable[1].reason, /does not exist/)
@@ -128,4 +130,28 @@ test('exceptionClauseFor answers the closed boundary of each confined mode', () 
     exceptionClauseFor('workspace-write'),
     ', whether or not they are inside the session workspace',
   )
+})
+
+test('expandPresetDirs carries workspace entries as subpaths, per preset', async () => {
+  const base = await mkdtemp(join(tmpdir(), 'dsh-presets-'))
+  try {
+    const good = join(base, 'good')
+    await mkdir(good)
+
+    const { entries } = normalizePresets({
+      rust: { writableDirs: [good, 'workspace:cargo', 'workspace:cargo/target'] },
+      scratch: { sandbox: 'read-only', writableDirs: ['workspace:notes'] },
+    })
+    const { roots, workspaceRoots, unusable } = await expandPresetDirs(entries)
+
+    // A workspace entry is never turned into an absolute path here: the root
+    // it belongs to is the session's, which does not exist at this point.
+    assert.deepEqual(roots.get('rust'), [good])
+    assert.deepEqual(workspaceRoots.get('rust'), ['cargo', 'cargo/target'])
+    assert.deepEqual(roots.get('scratch'), [])
+    assert.deepEqual(workspaceRoots.get('scratch'), ['notes'])
+    assert.deepEqual(unusable, [], 'a workspace entry is not a rejection')
+  } finally {
+    await rm(base, { recursive: true, force: true })
+  }
 })

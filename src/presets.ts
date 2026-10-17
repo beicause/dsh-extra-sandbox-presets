@@ -190,7 +190,14 @@ export function presetSpecOf(entry: PresetEntry): PresetSpec {
 
 /** The outcome of expanding every preset's configured directories. */
 export interface ExpandedPresetDirs {
+  /** Canonical absolute directories per preset name. */
   readonly roots: Map<string, string[]>
+  /**
+   * Workspace subpaths per preset name. These name directories inside the
+   * session workspace, so they become real paths only against the workspace
+   * root of the session making a call.
+   */
+  readonly workspaceRoots: Map<string, string[]>
   readonly unusable: UnusablePresetDir[]
 }
 
@@ -230,13 +237,15 @@ export function exceptionClauseFor(mode: ConfinedMode): string {
  */
 export async function expandPresetDirs(entries: readonly PresetEntry[]): Promise<ExpandedPresetDirs> {
   const roots = new Map<string, string[]>()
+  const workspaceRoots = new Map<string, string[]>()
   const unusable: UnusablePresetDir[] = []
 
   for (const entry of entries) {
-    const { dirs, rejected } = await expandExtraDirs(entry.writableDirs)
+    const { dirs, workspaceDirs, rejected } = await expandExtraDirs(entry.writableDirs)
     roots.set(entry.name, dirs)
+    workspaceRoots.set(entry.name, workspaceDirs)
     for (const rejection of rejected) unusable.push({ name: entry.name, ...rejection })
   }
 
-  return { roots, unusable }
+  return { roots, workspaceRoots, unusable }
 }

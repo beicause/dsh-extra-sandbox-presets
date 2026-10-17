@@ -7,7 +7,14 @@
 #   - the mounted filesystem's containment check gains a retry against the
 #     directories the selected preset grants, in every confined mode;
 #   - the sandbox provider's `confine` gains the matching `--bind` pairs in the
-#     bwrap profile, so confined children agree with the write/edit tools.
+#     bwrap profile, so confined children agree with the write/edit tools;
+#   - a runtime context of its own, placed right after the stock `sandbox:policy`
+#     note, names those directories so the model is told about the widening. It is
+#     a context of its own because the agent loop re-resolves every context from
+#     its registered provider, which discards a rewrite of another subsystem's
+#     entry; re-rendering from the live selection is what makes it follow a preset
+#     switch. A `danger-full-access` preset contributes nothing, since that mode
+#     already confines nothing.
 #
 # No stock row is disabled, replaced, or reordered. The three `SandboxMode`
 # values, the `sandbox/mode` session event, every persisted schema, and the

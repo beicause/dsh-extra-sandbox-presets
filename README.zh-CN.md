@@ -46,16 +46,22 @@ fence 的重试**故意也覆盖 `read-only`**：自带 fence 在解析目标之
 
 模型可见的那段说明也需要同样修正，因为自带的 `sandbox:policy` 说明只按 mode 生成：
 `read-only` 下它声称什么都不可修改，`workspace-write` 下它只点名工作区，而选中的预设
-实际上还可能让更多目录可写。因此本插件监听 `system-prompt/assemble` 水波，把授予的目录
-**就地**追加到那段说明之后。两种受限模式下这段自带说明读起来都是一条封闭边界，因此
-追加句会把例外明白写出，而不是只靠 "additionally" 被理解为对上一句的覆盖：选中的预设
-是 `read-only` 时，它写明这些目录**即使在前面的只读策略下**也可写（自带那句是一条绝对
-禁令）；是 `workspace-write` 时，它写明这些目录**无论是否在 session workspace 内**都可
-写（自带那句只点名工作区，读起来就是全部可写范围）。选中的预设是 `danger-full-access`
-时，这段说明保持原样：该模式本身不限制任何路径，说这些目录“额外可写”会是假命题而非
-修正。另起一个自己的 context 更简单，但它会与自带那句话并列而
-互相矛盾；以同一个名字再注册一个 context 也不可行，因为 system-prompt 服务在同一层内
-以名字为键，重名会被拒绝。
+实际上还可能让更多目录可写。因此本插件**注册一个属于自己的运行时 context**，紧跟在自带
+说明之后，点名当前所选预设授予的目录。两种受限模式下自带说明读起来都是一条封闭边界，
+因此这句话会把例外明白写出，而不是只靠「additionally」被理解为对上一句的覆盖：选中的
+预设是 `read-only` 时，它写明这些目录**即使在前面的只读策略下**也可写（自带那句是一条
+绝对禁令）；是 `workspace-write` 时，它写明这些目录**无论是否在 session workspace 内**
+都可写（自带那句只点名工作区，读起来就是全部可写范围）。选中的预设是
+`danger-full-access` 时，本插件什么都不注入：该模式本身不限制任何路径，说这些目录
+「额外可写」会是假命题而非修正。
+
+注入采用自己的 context 而非改写自带那句，这一区别正是它能到达模型的原因。agent loop
+在准备每次请求时会**从各自注册的 provider 重新解析每个运行时 context**，并把结果记录
+成下一步读取的快照。因此，若本插件在 `system-prompt/assemble` 水波里改写别的子系统的
+条目，这段文字会出现在直接调用 `assemble()` 的结果里，却**不会出现在任何真实步骤中**
+——provider 自己的文本会把它替换掉。而属于本插件自己的 provider 能挺过这次刷新，并且
+每次从当前选择重新渲染，因此那句说明会跟随预设切换。以自带的名字注册也不可行：
+system-prompt 服务在同一层内以名字为键，重名会被拒绝。
 
 由此产生两个性质，两者都很重要：
 
@@ -114,6 +120,25 @@ fence 的重试**故意也覆盖 `read-only`**：自带 fence 在解析目标之
 `approval` 不是上述取值，它同样会被拒绝并告警，而不会被发布；保留名 `custom` 与
 `auto` 也是如此。
 
+以 `workspace:` 前缀开头的条目表示**相对于会话工作区**的路径，并按每个会话各自解析：
+
+```yaml
+workspace-write-extra:
+  writableDirs:
+    - /srv/shared-assets
+    - workspace:notes        # <会话工作区>/notes
+    - workspace:cargo/target # <会话工作区>/cargo/target
+```
+
+工作区下的目录在每次调用时解析，针对的是 harness 为调用会话折算出的根，而不是在插件加载
+时解析一次：工作区属于会话，而插件在那一刻还不知道它。因此同一个条目在每个会话中含义
+相同，模型可见的那段说明也会给出真实路径。
+
+`workspace:` 条目必须是相对路径——`workspace:/etc` 与 `workspace:~/x` 会被拒绝并告警
+——且不得包含 `..`；包含 `..` 会被直接拒绝而非悄悄钳制，以免配置逃出工作区。工作区下
+尚不存在的目录仍然会被授予：该路径只被用于比较，而 bwrap profile 会跳过缺失的 bind
+源。
+
 `writableDirs` 只在受限模式下起作用。选了 `danger-full-access` 的预设仍可列出它们
 （它们也仍会出现在表里），但该模式本身不做任何限制，因此这些目录不会带来额外的可写
 范围，模型可见的那段说明也保持原样。
@@ -141,7 +166,7 @@ fence 的重试**故意也覆盖 `read-only`**：自带 fence 在解析目标之
 | `sandbox.confine(argv, policy, signal)` 解析为带 `argv` 的对象 | `src/provider.ts` |
 | policy 的 `mode`、`sessionId` 字段；结果的 `argv` 字段 | 两个包装 |
 | `permissionPresets.presets` 与 `emitCatalogChanged()` | `src/service.ts` |
-| `system-prompt/assemble` 水波，以及其中要修正的 `sandbox:policy` context | `src/service.ts` |
+| 提示词注册表，以及用于放置该说明、紧邻 `sandbox:policy` 的位置 | `src/service.ts` |
 
 有两个性质让它在升级中保持稳健：
 
@@ -165,7 +190,7 @@ fence 的重试**故意也覆盖 `read-only`**：自带 fence 在解析目标之
 
 | 文件 | 作用 |
 | --- | --- |
-| `src/service.ts` | `ctx.sandboxPresets`：持有已配置的预设表、按会话判定哪个预设生效、包装两个执行服务、发布预设，并在装配水波上修正自带沙箱说明。 |
+| `src/service.ts` | `ctx.sandboxPresets`：持有已配置的预设表、按会话判定哪个预设生效、把 `workspace:` 条目按调用会话解析、包装两个执行服务、发布预设，并在自带沙箱说明旁注册模型可见的那段说明。 |
 | `src/presets.ts` | 归一化配置的预设表，并展开每个预设的目录。 |
 | `src/fs.ts` | 包装运行中文件系统的包含性检查。 |
 | `src/provider.ts` | 包装运行中沙箱 provider 的 `confine`。 |
@@ -192,7 +217,8 @@ pnpm run typecheck  # tsc -p tsconfig.json (src + test)
 ## 测试
 
 ```
-node --test test/
+pnpm test                        # node --test test/*.test.ts
+node scripts/require-no-skips.mjs # 同一批用例，遇到跳过即失败
 ```
 
 `src/roots.ts`、`src/plan.ts`、`src/presets.ts` 与两个包装都不依赖外部包，随处可运行。契约套件
