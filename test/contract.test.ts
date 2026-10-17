@@ -19,15 +19,16 @@ import test from 'node:test'
 
 import { applyExtraDirsConfine } from '../lib/provider.js'
 import { applyExtraDirsFence } from '../lib/fs.js'
+import { optionalImport } from './support/host.ts'
 
-const dsh = async (specifier: string): Promise<unknown> => {
-  try {
-    return await import(specifier)
-  } catch (error) {
-    if ((error as { code?: unknown } | undefined)?.code === 'ERR_MODULE_NOT_FOUND') return undefined
-    throw error
-  }
-}
+/**
+ * Import a DSH package, resolving it from the pnpm store that installed the
+ * running `dsh` when a bare specifier does not resolve. A linked plugin does
+ * not have the DSH packages in its own resolution chain, so the bare import
+ * alone skips every contract case — which is exactly the wrong outcome for
+ * tests whose purpose is to pin the stock interfaces.
+ */
+const dsh = (specifier: string): Promise<Record<string, unknown> | undefined> => optionalImport(specifier)
 
 /** One resolved filesystem target, as the fence wrapper reads it. */
 interface FenceTargetShape {
@@ -140,10 +141,15 @@ test('the stock sandbox provider still offers the seam the confine wrapper needs
   // On Linux the real provider selects the bwrap rung, and `confine` resolves
   // to an object whose `argv` the wrapper edits. Every field it touches is
   // pinned here, so a return-shape change fails this contract.
+  //
+  // This plugin extends bwrap only: on any other rung it reports the backend as
+  // unsupported rather than widening it. A host without bwrap therefore does
+  // not narrow this assertion, it fails the contract — a silent Landlock
+  // fallback would leave every configured preset granting nothing.
   if (process.platform === 'linux') {
     const result = await instance.confine(['true'], { mode: 'workspace-write', workspaceRoot: process.cwd() })
     assert.ok(Array.isArray(result.argv), 'the wrapper inserts into result.argv')
-    assert.equal(result.argv[0], 'bwrap', 'the rung the wrapper extends')
+    assert.equal(result.argv[0], 'bwrap', 'the wrapper only extends the bwrap profile')
     assert.equal(typeof result.enforcement, 'string', 'the result shape the wrapper spreads unchanged')
     assert.notEqual(result.argv.indexOf('--'), -1, 'the separator the wrapper inserts before')
   }

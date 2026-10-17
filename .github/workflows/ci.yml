@@ -1,0 +1,115 @@
+name: CI
+
+# This plugin only makes sense where bubblewrap exists: it extends the bwrap
+# profile of the local sandbox provider and reports every other backend as
+# unsupported. A macOS or Windows job would therefore exercise nothing it
+# actually does, so the matrix is Linux only by design rather than by omission.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest supported runtime and the current one. `node --test` and
+        # native type stripping are the only runtime features this repository
+        # relies on, so the spread is kept narrow on purpose.
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bubblewrap
+        # The runner image does not ship bubblewrap, and the provider silently
+        # falls back to Landlock without it — which would leave the whole
+        # bwrap half of this plugin untested. Installing it is therefore part
+        # of the contract with the test suite, not an optional convenience.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+          bwrap --version
+
+      - name: Relax the unprivileged user-namespace restriction
+        # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor,
+        # which makes `bwrap` fail at runtime even though it is installed.
+        run: |
+          sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
+          sudo sysctl --write kernel.unprivileged_userns_clone=1 || true
+
+      - name: Verify bubblewrap can confine
+        # Fail here, loudly, rather than letting the sandbox tests take an
+        # untested fallback path.
+        run: bwrap --ro-bind / / --dev /dev --unshare-pid --proc /proc -- true
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - name: Install dependencies
+        # The DSH packages the tests pin are devDependencies, not a global
+        # install: the suites import them directly, and a pinned version keeps
+        # the contract tests meaningful instead of tracking whatever `dsh`
+        # happens to be on the machine.
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        # The suites import the compiled output under `lib/`, which is a build
+        # artifact and not tracked, so it has to exist before anything that
+        # loads it runs.
+        run: pnpm run build
+
+      - name: Typecheck
+        # The declaration files under `lib/` are what the suites' imports
+        # resolve to, so this also checks that comment above.
+        run: pnpm run typecheck
+
+      - name: Test
+        run: pnpm test
+
+  audit:
+    name: no silent skips
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+          sudo sysctl --write kernel.apparmor_restrict_unprivileged_userns=0
+          sudo sysctl --write kernel.unprivileged_userns_clone=1 || true
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Fail when a test skipped
+        # Every case pins an interface this plugin depends on, so a skip means
+        # the environment could not resolve the DSH packages and the suite is
+        # not actually checking anything. A skip is treated as a failure, so a
+        # compatibility break cannot reach a release as a quiet green run.
+        run: node scripts/require-no-skips.mjs

@@ -454,11 +454,17 @@ export class ExtraSandboxPresetsService extends Service {
         // relying on "additionally" to be read as an override of the sentence
         // before it. `danger-full-access` returned above, so only confined
         // modes reach the clause.
-        const note = 'The current DSH file policy additionally allows writing these configured directories'
+        //
+        // The preset name is named because a configured preset is what grants
+        // the directories: when several are configured, the model has to know
+        // which one is in force to answer whether a path is writable. The
+        // injector is named so the note can be traced back to its source.
+        const note = `The ${name} plugin additionally allows writing these configured directories`
+          + ` while the "${entry.name}" preset is selected`
           + exceptionClauseFor(entry.sandbox)
           + ': '
           + `${roots.map((root) => `"${root}"`).join(', ')}. `
-          + 'They apply only while the permission preset that configures them is selected.'
+          + 'They apply only while that preset remains selected.'
         return {
           ...assembled,
           contexts: assembled.contexts.map((entry) =>

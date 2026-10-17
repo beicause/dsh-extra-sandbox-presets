@@ -17,14 +17,16 @@ import test from 'node:test'
 
 import type { Context } from '@deepseek-ai/cordis'
 
-const dsh = async (specifier: string): Promise<unknown> => {
-  try {
-    return await import(specifier)
-  } catch (error) {
-    if ((error as { code?: unknown } | undefined)?.code === 'ERR_MODULE_NOT_FOUND') return undefined
-    throw error
-  }
-}
+import { optionalImport } from './support/host.ts'
+
+/**
+ * Import a DSH package, resolving it from the pnpm store that installed the
+ * running `dsh` when a bare specifier does not resolve. A linked plugin does
+ * not have the DSH packages in its own resolution chain, so the bare import
+ * alone skips every contract case — which is exactly the wrong outcome for
+ * tests whose purpose is to pin the stock interfaces.
+ */
+const dsh = (specifier: string): Promise<Record<string, unknown> | undefined> => optionalImport(specifier)
 
 /** The plugin's published preset spec, as the permission table stores it. */
 interface PresetSpecShape {
@@ -307,7 +309,10 @@ test('each preset grants only its own directories, and only to its own session',
     }
     const widened = await assemble()
     assert.ok(widened.startsWith(stockNote), 'the stock wording is kept')
-    assert.match(widened, /additionally allows writing these configured directories/)
+    assert.match(widened, /dsh-extra-sandbox-presets plugin additionally allows writing these configured directories/)
+    // The preset that grants the directories is named, so a session with more
+    // than one configured preset can tell which one is in force.
+    assert.ok(widened.includes('"workspace-write-extra" preset'), 'the granting preset is named')
     assert.ok(widened.includes(`"${workspaceExtra}"`), 'the granted directory is named')
     // The standing policy is workspace-write, where the stock note names the
     // session workspace as the writable area, so the exception is stated
@@ -320,6 +325,8 @@ test('each preset grants only its own directories, and only to its own session',
     assert.deepEqual(service.dirsForPreset('workspace-write-extra'), [workspaceExtra])
     const readOnlyNote = await assemble()
     assert.ok(readOnlyNote.includes(`"${scratch}"`), 'the note follows the selected preset')
+    assert.ok(readOnlyNote.includes('"scratch" preset'), 'the newly selected preset is named')
+    assert.doesNotMatch(readOnlyNote, /"workspace-write-extra" preset/, 'the previous preset is no longer named')
     // This preset is read-only, so the exception is stated outright.
     assert.match(readOnlyNote, /even under the read-only policy above/)
 

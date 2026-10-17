@@ -6,6 +6,10 @@
     "moduleResolution": "nodenext",
     "strict": true,
     "noEmit": true,
+    // Tests import their shared fixture by its `.ts` path so Node's own type
+    // stripping loads it directly, with no build step between editing it and
+    // running the suite. Only the type-check config needs this.
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "types": ["node"],
     "verbatimModuleSyntax": true,
