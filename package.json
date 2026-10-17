@@ -23,7 +23,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node --test test/",
+    "test": "node --test test/*.test.ts",
     "prepare": "pnpm run build"
   },
   "peerDependencies": {

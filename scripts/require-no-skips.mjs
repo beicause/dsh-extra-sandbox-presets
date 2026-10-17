@@ -12,15 +12,26 @@
  */
 
 import { spawn } from 'node:child_process'
+import { readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 
+/**
+ * Every case file, listed explicitly. Naming the directory makes the older
+ * runners treat the argument as a single file and fail to load it, so the files
+ * are enumerated here instead of left to the runner's discovery.
+ * @returns test file paths relative to the repository root.
+ */
+const testFiles = readdirSync(join(root, 'test'))
+  .filter((name) => name.endsWith('.test.ts'))
+  .map((name) => join('test', name))
+
 /** Run the suite with the TAP reporter and collect its output. */
 const runSuite = () => new Promise((resolve, reject) => {
-  // The reporter flag must precede the path, or Node treats it as a test file.
-  const child = spawn(process.execPath, ['--test', '--test-reporter=tap', 'test/'], {
+  // The reporter flag must precede the paths, or Node treats them as test files.
+  const child = spawn(process.execPath, ['--test', '--test-reporter=tap', ...testFiles], {
     cwd: root,
     stdio: ['ignore', 'pipe', 'inherit'],
   })
