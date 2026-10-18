@@ -25,36 +25,28 @@
 
 import { withExtraBinds } from './plan.js'
 
+/** @typedef {import('./contracts.js').ConfinedArgv} ConfinedArgv */
+/** @typedef {import('./contracts.js').ConfineDeps} ConfineDeps */
+
 /** Own-property key holding the wrapped method, so wrapping stays idempotent. */
 const WRAPPED = Symbol.for('dsh-extra-sandbox-presets/wrapped-confine')
-
-/** The confined invocation the stock provider returns. */
-export interface ConfinedArgv {
-  readonly argv: string[]
-  readonly [key: string]: unknown
-}
 
 /**
  * The slice of the live sandbox provider this wrapper extends. Declared locally
  * because the host's own typings are not a dependency of this package.
+ *
+ * @typedef {object} ConfineService
+ * @property {(this: ConfineService, argv: readonly string[], policy?: unknown, signal?: unknown) => Promise<ConfinedArgv>} confine
  */
-interface ConfineService {
-  confine(this: ConfineService, argv: readonly string[], policy?: unknown, signal?: unknown): Promise<ConfinedArgv>
-  [key: symbol]: unknown
-}
 
-/** Reporting hooks the service supplies. */
-export interface ConfineDeps {
-  /** Reports the extra directories that apply to one call's policy. */
-  extraRootsFor: (policy: unknown) => readonly string[]
-  /** Reports a runner whose profile this plugin cannot extend. */
-  reportUnsupported: (runner: string) => void
-}
-
-const isConfineService = (value: unknown): value is ConfineService =>
+/**
+ * @param {unknown} value
+ * @returns {value is ConfineService}
+ */
+const isConfineService = (value) =>
   typeof value === 'object'
   && value !== null
-  && typeof (value as { confine?: unknown }).confine === 'function'
+  && typeof /** @type {{ confine?: unknown }} */ (value).confine === 'function'
 
 /**
  * Wrap one sandbox provider instance so its confinement also binds the extra
@@ -65,28 +57,28 @@ const isConfineService = (value: unknown): value is ConfineService =>
  * caller reports that, so a harness upgrade that moves the seam is visible
  * instead of silently narrowing the preset.
  *
- * @param sandbox - the live sandbox provider service instance.
- * @param deps - reporting hooks: `extraRootsFor` and `reportUnsupported`.
- * @returns a disposer restoring the original method exactly, or `undefined`
- *   when this instance could not be wrapped.
+ * @param {unknown} sandbox - the live sandbox provider service instance.
+ * @param {ConfineDeps} deps - reporting hooks: `extraRootsFor` and `reportUnsupported`.
+ * @returns {(() => void) | undefined} a disposer restoring the original method exactly,
+ *   or `undefined` when this instance could not be wrapped.
  */
-export function applyExtraDirsConfine(
-  sandbox: unknown,
-  deps: ConfineDeps,
-): (() => void) | undefined {
+export function applyExtraDirsConfine(sandbox, deps) {
   if (!isConfineService(sandbox)) return undefined
-  if (sandbox[WRAPPED] !== undefined) return () => {}
+  const provider = /** @type {ConfineService & { [WRAPPED]?: unknown }} */ (sandbox)
+  if (provider[WRAPPED] !== undefined) return () => {}
   // The mount may define `confine` on the instance or inherit it from its
   // prototype; the descriptor records which, so restoring is exact either way.
-  const descriptor = Object.getOwnPropertyDescriptor(sandbox, 'confine')
-  const original = sandbox.confine
+  const descriptor = Object.getOwnPropertyDescriptor(provider, 'confine')
+  const original = provider.confine
 
-  const wrapped = async function confine(
-    this: ConfineService,
-    argv: readonly string[],
-    policy?: unknown,
-    signal?: unknown,
-  ): Promise<ConfinedArgv> {
+  /**
+   * @param {readonly string[]} argv
+   * @param {unknown} [policy]
+   * @param {unknown} [signal]
+   * @returns {Promise<ConfinedArgv>}
+   * @this {ConfineService}
+   */
+  const wrapped = async function confine(argv, policy, signal) {
     const result = await original.call(this, argv, policy, signal)
 
     const extra = deps.extraRootsFor(policy)
@@ -100,21 +92,21 @@ export function applyExtraDirsConfine(
     return { ...result, argv: withExtraBinds(result.argv, extra) }
   }
 
-  Object.defineProperty(sandbox, WRAPPED, {
+  Object.defineProperty(provider, WRAPPED, {
     value: original,
     configurable: true,
     writable: true,
   })
-  Object.defineProperty(sandbox, 'confine', {
+  Object.defineProperty(provider, 'confine', {
     value: wrapped,
     configurable: true,
     writable: true,
   })
   return () => {
     // Only undo our own wrapping; a later wrapper owns its own restore.
-    if (sandbox.confine !== wrapped) return
-    if (descriptor === undefined) delete (sandbox as { confine?: unknown }).confine
-    else Object.defineProperty(sandbox, 'confine', descriptor)
-    delete sandbox[WRAPPED]
+    if (provider.confine !== wrapped) return
+    if (descriptor === undefined) delete /** @type {{ confine?: unknown }} */ (provider).confine
+    else Object.defineProperty(provider, 'confine', descriptor)
+    delete provider[WRAPPED]
   }
 }

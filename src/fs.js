@@ -20,39 +20,42 @@
 
 import { isPathUnder } from './roots.js'
 
+/** @typedef {import('./contracts.js').FenceTarget} FenceTarget */
+/** @typedef {import('./contracts.js').ExtraRootsFor} ExtraRootsFor */
+
 /** Own-property key holding the wrapped method, so wrapping stays idempotent. */
 const WRAPPED = Symbol.for('dsh-extra-sandbox-presets/wrapped-fence')
 
 /** The denial code the stock fence raises for a containment failure. */
 const DENIED = 'FS_SANDBOX_DENIED'
 
-/** The resolved target the stock fence checks and returns. */
-export interface FenceTarget {
-  readonly displayPath: string
-  readonly targetKey: string
-}
-
 /**
  * The slice of the live filesystem service this wrapper extends. Declared
  * locally because the host's own typings are not a dependency of this package.
+ *
+ * @typedef {object} FenceService
+ * @property {(this: FenceService, target: { displayPath: string }, sandboxPolicy?: unknown) => Promise<FenceTarget>} checkedTarget
+ *   Accepts a second `sandboxPolicy` argument, which callers may omit.
+ * @property {(path: string) => Promise<FenceTarget>} resolve
  */
-interface FenceService {
-  checkedTarget(this: FenceService, target: FenceTarget, sandboxPolicy?: unknown): Promise<FenceTarget>
-  resolve(path: string): Promise<FenceTarget>
-  [key: symbol]: unknown
-}
 
-/** Reports the extra directories that apply to one call's policy. */
-export type ExtraRootsFor = (policy: unknown) => readonly string[]
+/**
+ * Whether the caught value is the stock fence's containment denial.
+ *
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+const isDenial = (error) =>
+  typeof error === 'object' && error !== null && /** @type {{ code?: unknown }} */ (error).code === DENIED
 
-/** Whether the caught value is the stock fence's containment denial. */
-const isDenial = (error: unknown): boolean =>
-  typeof error === 'object' && error !== null && (error as { code?: unknown }).code === DENIED
-
-const isFenceService = (value: unknown): value is FenceService =>
+/**
+ * @param {unknown} value
+ * @returns {value is FenceService}
+ */
+const isFenceService = (value) =>
   typeof value === 'object'
   && value !== null
-  && typeof (value as { checkedTarget?: unknown }).checkedTarget === 'function'
+  && typeof /** @type {{ checkedTarget?: unknown }} */ (value).checkedTarget === 'function'
 
 /**
  * Wrap one filesystem service instance so it also accepts the extra directories
@@ -63,27 +66,27 @@ const isFenceService = (value: unknown): value is FenceService =>
  * `checkedTarget` moved. The caller reports that, so a harness upgrade that
  * moves the seam is visible instead of silently narrowing the preset.
  *
- * @param fs - the live filesystem service instance.
- * @param extraRootsFor - reports the extra directories that apply to a policy.
- * @returns a disposer restoring the original method exactly, or `undefined`
- *   when this instance could not be wrapped.
+ * @param {unknown} fs - the live filesystem service instance.
+ * @param {ExtraRootsFor} extraRootsFor - reports the extra directories that apply to a policy.
+ * @returns {(() => void) | undefined} a disposer restoring the original method exactly,
+ *   or `undefined` when this instance could not be wrapped.
  */
-export function applyExtraDirsFence(
-  fs: unknown,
-  extraRootsFor: ExtraRootsFor,
-): (() => void) | undefined {
+export function applyExtraDirsFence(fs, extraRootsFor) {
   if (!isFenceService(fs)) return undefined
-  if (fs[WRAPPED] !== undefined) return () => {}
+  const fence = /** @type {FenceService & { [WRAPPED]?: unknown }} */ (fs)
+  if (fence[WRAPPED] !== undefined) return () => {}
   // The mount may define the check on the instance or inherit it from its
   // prototype; the descriptor records which, so restoring is exact either way.
-  const descriptor = Object.getOwnPropertyDescriptor(fs, 'checkedTarget')
-  const original = fs.checkedTarget
+  const descriptor = Object.getOwnPropertyDescriptor(fence, 'checkedTarget')
+  const original = fence.checkedTarget
 
-  const wrapped = async function checkedTarget(
-    this: FenceService,
-    target: FenceTarget,
-    sandboxPolicy?: unknown,
-  ): Promise<FenceTarget> {
+  /**
+   * @param {FenceTarget} target
+   * @param {unknown} [sandboxPolicy]
+   * @returns {Promise<FenceTarget>}
+   * @this {FenceService}
+   */
+  const wrapped = async function checkedTarget(target, sandboxPolicy) {
     try {
       return await original.call(this, target, sandboxPolicy)
     } catch (error) {
@@ -103,21 +106,21 @@ export function applyExtraDirsFence(
     }
   }
 
-  Object.defineProperty(fs, WRAPPED, {
+  Object.defineProperty(fence, WRAPPED, {
     value: original,
     configurable: true,
     writable: true,
   })
-  Object.defineProperty(fs, 'checkedTarget', {
+  Object.defineProperty(fence, 'checkedTarget', {
     value: wrapped,
     configurable: true,
     writable: true,
   })
   return () => {
     // Only undo our own wrapping; a later wrapper owns its own restore.
-    if (fs[WRAPPED] !== undefined && fs.checkedTarget !== wrapped) return
-    if (descriptor === undefined) delete (fs as { checkedTarget?: unknown }).checkedTarget
-    else Object.defineProperty(fs, 'checkedTarget', descriptor)
-    delete fs[WRAPPED]
+    if (fence[WRAPPED] !== undefined && fence.checkedTarget !== wrapped) return
+    if (descriptor === undefined) delete /** @type {{ checkedTarget?: unknown }} */ (fence).checkedTarget
+    else Object.defineProperty(fence, 'checkedTarget', descriptor)
+    delete fence[WRAPPED]
   }
 }

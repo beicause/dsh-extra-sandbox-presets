@@ -187,18 +187,18 @@ This plugin declares no `@deepseek-ai/dsh-*` peer range, and the harness checks
 only such peers. Its compatibility therefore rests on something narrower and
 more exact: **the shape of two mounted services** (plus one event and one
 context name). That shape is what the code actually uses, and the service half
-is pinned by `test/contract.test.ts` against the real classes, so a harness
+is pinned by `test/contract.test`.js` against the real classes, so a harness
 upgrade that moves any of it fails the suite immediately rather than narrowing a
 preset in production.
 
 | Depends on | Used by |
 | --- | --- |
-| `fs.checkedTarget(target, policy)` rejects with code `FS_SANDBOX_DENIED` | `src/fs.ts` |
-| `fs.resolve(path)` resolves a target carrying `targetKey` | `src/fs.ts` |
-| `sandbox.confine(argv, policy, signal)` resolves to an object carrying `argv` | `src/provider.ts` |
+| `fs.checkedTarget(target, policy)` rejects with code `FS_SANDBOX_DENIED` | `src/fs`.js` |
+| `fs.resolve(path)` resolves a target carrying `targetKey` | `src/fs`.js` |
+| `sandbox.confine(argv, policy, signal)` resolves to an object carrying `argv` | `src/provider`.js` |
 | Policy fields `mode` and `sessionId`; result field `argv` | both wrappers |
-| `permissionPresets.presets` and `emitCatalogChanged()` | `src/service.ts` |
-| The prompt registry, and a `sandbox:policy` context to place the note beside | `src/service.ts` |
+| `permissionPresets.presets` and `emitCatalogChanged()` | `src/service`.js` |
+| The prompt registry, and a `sandbox:policy` context to place the note beside | `src/service`.js` |
 
 Two properties keep this robust across upgrades:
 
@@ -227,44 +227,45 @@ logged warning and stock behaviour — never a missing filesystem or sandbox.
 
 | File | Role |
 | --- | --- |
-| `src/service.ts` | `ctx.sandboxPresets`: owns the configured preset table, decides per session which preset applies, resolves `workspace:` entries against the calling session, wraps the two enforcement services, publishes the presets, and registers the model-facing note beside the stock sandbox note. |
-| `src/presets.ts` | Normalizes the configured table and expands each preset's directories. |
-| `src/fs.ts` | Wraps the live filesystem's containment check. |
-| `src/provider.ts` | Wraps the live sandbox provider's `confine`. |
-| `src/roots.ts` | Path expansion and containment checks. |
-| `src/plan.ts` | Pure bwrap argv transformation. |
+| `src/service`.js` | `ctx.sandboxPresets`: owns the configured preset table, decides per session which preset applies, resolves `workspace:` entries against the calling session, wraps the two enforcement services, publishes the presets, and registers the model-facing note beside the stock sandbox note. |
+| `src/presets`.js` | Normalizes the configured table and expands each preset's directories. |
+| `src/fs`.js` | Wraps the live filesystem's containment check. |
+| `src/provider`.js` | Wraps the live sandbox provider's `confine`. |
+| `src/roots`.js` | Path expansion and containment checks. |
+| `src/plan`.js` | Pure bwrap argv transformation. |
 | `cordis.patch.yml` | Inserts the one plugin row. |
-| `test/contract.test.ts` | Pins the harness seams this plugin extends. |
+| `test/contract.test.js` | Pins the harness seams this plugin extends. |
 
-`lib/` is the compiled output of `src/` (`tsc -p tsconfig.build.json`) and is
-git-ignored: it is a build artifact, and `src/` is the only source of truth.
-`prepare` builds it, so `pnpm install` inside the repository produces `lib/`.
-Edit `src/`, never `lib/`.
+The sources are plain JavaScript with JSDoc types, and `src/contracts.d.ts`
+carries the structural shapes JSDoc states poorly. The package runs **from
+source**: `main` and `exports` point at `src/`, so there is no build step and no
+`lib/` — what you edit is exactly what the harness loads.
 
 Note that the profile installs this package by **symlink** (`link:`), pointing at
-this working tree, and pnpm runs no lifecycle script for a `link:` dependency —
-so an install through the profile does not build. Build here, in the repository,
-and the linked profile picks up whatever `lib/` currently holds.
+this working tree, so an edit to `src/` is live for the profile immediately;
+only the plugin must be reloaded.
 
-## Build
+## Typecheck
 
 ```
-pnpm run build      # tsc -p tsconfig.build.json -> lib/
-pnpm run typecheck  # tsc -p tsconfig.json (src + test)
+pnpm run typecheck  # tsc -p tsconfig.json: checkJs over src/ and test/
 ```
+
+The DSH packages are peer/dev dependencies only for their `.d.ts`; the runtime
+imports nothing from them that the harness does not already provide.
 
 ## Tests
 
 ```
-pnpm test                        # node --test test/*.test.ts
+pnpm test                        # node --test test/*.test.js
 node scripts/require-no-skips.mjs # same run, failing on any skip
 ```
 
-`src/roots.ts`, `src/plan.ts`, `src/presets.ts`, and the two wrappers are
+`src/roots.js`, `src/plan.js`, `src/presets.js`, and the two wrappers are
 dependency-free and run anywhere. The contract and integration suites need the
 DSH packages to be resolvable, so they run from an installed profile: the
 contract suite pins the real stock seams, and the integration suite assembles the
 real filesystem and sandbox provider and asserts both the widening and its exact
 reversal on unload. Every suite that needs those packages skips with a reason
-when they are absent, and never passes vacuously. The suite runs against the
-compiled `lib/`, so run `pnpm run build` first.
+when they are absent, and never passes vacuously. Nothing to build first: the
+suite runs against the same `src/` the harness loads.

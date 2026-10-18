@@ -25,7 +25,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..')
  * @returns test file paths relative to the repository root.
  */
 const testFiles = readdirSync(join(root, 'test'))
-  .filter((name) => name.endsWith('.test.ts'))
+  .filter((name) => name.endsWith('.test.js'))
   .map((name) => join('test', name))
 
 /** Run the suite with the TAP reporter and collect its output. */

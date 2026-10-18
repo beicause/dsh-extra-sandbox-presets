@@ -5,19 +5,18 @@
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "strict": true,
+    // The sources are JavaScript with JSDoc types; the declaration module
+    // src/contracts.d.ts carries the shapes JSDoc states poorly. Checking is
+    // the whole job here: the package runs from source, so nothing is emitted.
+    "allowJs": true,
+    "checkJs": true,
     "noEmit": true,
-    // Tests import their shared fixture by its `.ts` path so Node's own type
-    // stripping loads it directly, with no build step between editing it and
-    // running the suite. Only the type-check config needs this.
-    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "types": ["node"],
-    "verbatimModuleSyntax": true,
-    "isolatedModules": true,
     "forceConsistentCasingInFileNames": true,
     // The DSH packages are installed in this workspace through symlinks. Keeping
-    // symlinked paths unresolvable-as-real keeps the emitted declarations
-    // portable: they name `@deepseek-ai/schemastery` instead of a store path.
+    // symlinked paths unresolvable-as-real keeps declared types portable: they
+    // name '@deepseek-ai/...' instead of a store path.
     "preserveSymlinks": true
   },
   "include": ["src", "test"]

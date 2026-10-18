@@ -6,24 +6,11 @@
  */
 
 import { realpath, stat } from 'node:fs/promises'
-import type { BigIntStats, Stats } from 'node:fs'
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { homedir } from 'node:os'
 
-/** One configured directory that could not be used, with the reason why. */
-export interface RejectedEntry {
-  readonly entry: unknown
-  readonly reason: string
-}
-
-/** The usable directories plus the entries that were rejected. */
-export interface ExpandedDirs {
-  /** Canonical absolute directories, usable as they are. */
-  readonly dirs: string[]
-  /** Subpaths of the session workspace, resolvable only per session. */
-  readonly workspaceDirs: string[]
-  readonly rejected: RejectedEntry[]
-}
+/** @typedef {import('./contracts.js').RejectedEntry} RejectedEntry */
+/** @typedef {import('./contracts.js').ExpandedDirs} ExpandedDirs */
 
 /**
  * Prefix marking a configured directory as relative to the session workspace.
@@ -35,27 +22,42 @@ export interface ExpandedDirs {
  * policy folds. The workspace belongs to the session, which the plugin does not
  * know while it loads, so an entry naming one cannot become a real path until a
  * call supplies that session's root.
+ *
+ * @type {'workspace:'}
  */
 export const WORKSPACE_PREFIX = 'workspace:'
 
-const MISSING_CODES: ReadonlySet<unknown> = new Set(['ENOENT', 'ENOTDIR'])
+/** @type {ReadonlySet<unknown>} */
+const MISSING_CODES = new Set(['ENOENT', 'ENOTDIR'])
 
 /** Read `error.code` without asserting the caught value's shape. */
-const codeOf = (error: unknown): unknown =>
-  typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined
+/** @param {unknown} error */
+const codeOf = (error) =>
+  typeof error === 'object' && error !== null ? /** @type {{ code?: unknown }} */ (error).code : undefined
 
-const isMissing = (error: unknown): boolean => MISSING_CODES.has(codeOf(error))
+/** @param {unknown} error */
+const isMissing = (/** @type {unknown} */ error) => MISSING_CODES.has(codeOf(error))
 
-/** Render `String(error?.message ?? error)` for an unknown caught value. */
-const detailOf = (error: unknown): string => {
+/**
+ * Render `String(error?.message ?? error)` for an unknown caught value.
+ *
+ * @param {unknown} error
+ */
+const detailOf = (error) => {
   const message = typeof error === 'object' && error !== null
-    ? (error as { message?: unknown }).message
+    ? /** @type {{ message?: unknown }} */ (error).message
     : undefined
   return message === undefined || message === null ? String(error) : String(message)
 }
 
-/** Resolve a configured entry to an absolute path, expanding a leading `~`. */
-export function absoluteEntry(entry: unknown): string | undefined {
+/**
+ * Resolve a configured entry to an absolute path, expanding a leading `~`.
+ *
+ * @param {unknown} entry - one raw configured directory entry.
+ * @returns {string | undefined} the absolute path, or `undefined` when the
+ *   entry is not one (a relative path, a non-string, or blank).
+ */
+export function absoluteEntry(entry) {
   if (typeof entry !== 'string') return undefined
   const trimmed = entry.trim()
   if (trimmed === '') return undefined
@@ -70,18 +72,17 @@ export function absoluteEntry(entry: unknown): string | undefined {
  * A workspace-relative entry is kept as a subpath: it can only be resolved
  * against the workspace root of the session making a call, which the loader
  * cannot know. The result distinguishes the cases the caller must treat
- * differently - an entry that is not workspace-relative at all, a usable
- * subpath, and a prefixed entry that cannot name a subpath - so a mistake such
+ * differently — an entry that is not workspace-relative at all, a usable
+ * subpath, and a prefixed entry that cannot name a subpath — so a mistake such
  * as `workspace:/etc` is reported as that mistake rather than as a missing
  * leading slash.
  *
- * @param entry - one raw configured directory entry.
- * @returns `kind: 'none'` for an unprefixed entry, `'subpath'` with the
- *   normalized subpath, or `'invalid'` with the reason it cannot be used.
+ * @param {string} entry - one raw configured directory entry.
+ * @returns {{ kind: 'none' } | { kind: 'subpath'; subpath: string } | { kind: 'invalid'; reason: string }}
+ *   `kind: 'none'` for an unprefixed entry, `'subpath'` with the normalized
+ *   subpath, or `'invalid'` with the reason it cannot be used.
  */
-function readWorkspaceEntry(
-  entry: string,
-): { kind: 'none' } | { kind: 'subpath'; subpath: string } | { kind: 'invalid'; reason: string } {
+function readWorkspaceEntry(entry) {
   if (!entry.startsWith(WORKSPACE_PREFIX)) return { kind: 'none' }
   const rest = entry.slice(WORKSPACE_PREFIX.length).trim()
   if (rest === '' || rest === '.' || rest === './') return { kind: 'subpath', subpath: '' }
@@ -115,17 +116,21 @@ function readWorkspaceEntry(
  * same applies to a `..` inside a workspace subpath, which is refused rather
  * than silently clamped.
  *
- * @param entries - raw configured directory entries.
- * @returns the usable canonical directories, the workspace subpaths, and the
- *   rejected entries.
+ * @param {unknown} entries - raw configured directory entries.
+ * @returns {Promise<ExpandedDirs>} the usable canonical directories, the
+ *   workspace subpaths, and the rejected entries.
  */
-export async function expandExtraDirs(entries: unknown): Promise<ExpandedDirs> {
-  const dirs: string[] = []
-  const workspaceDirs: string[] = []
-  const rejected: RejectedEntry[] = []
-  const seen = new Set<string>()
+export async function expandExtraDirs(entries) {
+  /** @type {string[]} */
+  const dirs = []
+  /** @type {string[]} */
+  const workspaceDirs = []
+  /** @type {RejectedEntry[]} */
+  const rejected = []
+  /** @type {Set<string>} */
+  const seen = new Set()
 
-  for (const entry of Array.isArray(entries) ? (entries as unknown[]) : []) {
+  for (const entry of Array.isArray(entries) ? entries : []) {
     if (typeof entry !== 'string' || entry.trim() === '') {
       rejected.push({ entry, reason: 'blank entry' })
       continue
@@ -149,14 +154,14 @@ export async function expandExtraDirs(entries: unknown): Promise<ExpandedDirs> {
       rejected.push({ entry, reason: 'not an absolute path (a leading ~ is allowed)' })
       continue
     }
-    let canonical: string
+    let canonical
     try {
       canonical = await realpath(absolute)
     } catch (error) {
       rejected.push({ entry, reason: isMissing(error) ? 'does not exist' : detailOf(error) })
       continue
     }
-    let info: Stats
+    let info
     try {
       info = await stat(canonical)
     } catch (error) {
@@ -183,18 +188,20 @@ export async function expandExtraDirs(entries: unknown): Promise<ExpandedDirs> {
  * does not exist yet stays a plain candidate — the fence never grants a path it
  * cannot resolve, and the bwrap profile skips a source that is missing.
  *
- * @param subpath - the subpath recorded for a `workspace:` entry, possibly empty.
- * @param workspaceRoot - the session's absolute workspace root.
- * @returns the absolute path the subpath names.
+ * @param {string} subpath - the subpath recorded for a `workspace:` entry, possibly empty.
+ * @param {string} workspaceRoot - the session's absolute workspace root.
+ * @returns {string} the absolute path the subpath names.
  */
-export function workspaceEntryPath(subpath: string, workspaceRoot: string): string {
+export function workspaceEntryPath(subpath, workspaceRoot) {
   return subpath === '' ? workspaceRoot : join(workspaceRoot, subpath)
 }
 
-const comparable = (path: string): string =>
+/** @param {string} path */
+const comparable = (path) =>
   process.platform === 'win32' ? path.toLowerCase() : path
 
-async function statIfPresent(path: string): Promise<BigIntStats | undefined> {
+/** @param {string} path */
+async function statIfPresent(path) {
   try {
     return await stat(path, { bigint: true })
   } catch (error) {
@@ -203,7 +210,11 @@ async function statIfPresent(path: string): Promise<BigIntStats | undefined> {
   }
 }
 
-const sameIdentity = (left: BigIntStats, right: BigIntStats): boolean =>
+/**
+ * @param {import('node:fs').BigIntStats} left
+ * @param {import('node:fs').BigIntStats} right
+ */
+const sameIdentity = (left, right) =>
   left.dev === right.dev && left.ino === right.ino
 
 /**
@@ -212,11 +223,11 @@ const sameIdentity = (left: BigIntStats, right: BigIntStats): boolean =>
  * existing ancestors and comparing filesystem identity recognizes aliases such
  * as bind mounts and symlinked prefixes.
  *
- * @param path - canonical target path, which may end in a missing suffix.
- * @param root - canonical writable root.
- * @returns whether the target is the root or a descendant of it.
+ * @param {string} path - canonical target path, which may end in a missing suffix.
+ * @param {string} root - canonical writable root.
+ * @returns {Promise<boolean>} whether the target is the root or a descendant of it.
  */
-export async function isPathUnder(path: string, root: string): Promise<boolean> {
+export async function isPathUnder(path, root) {
   const target = comparable(path)
   const base = comparable(root)
   if (target === base) return true
@@ -235,9 +246,15 @@ export async function isPathUnder(path: string, root: string): Promise<boolean> 
   }
 }
 
-/** Whether any configured root contains `path`. */
-export async function isUnderAny(path: string, roots: unknown): Promise<boolean> {
-  for (const root of Array.isArray(roots) ? (roots as unknown[]) : []) {
+/**
+ * Whether any configured root contains `path`.
+ *
+ * @param {string} path - canonical target path.
+ * @param {unknown} roots - the configured roots, an array of entries.
+ * @returns {Promise<boolean>}
+ */
+export async function isUnderAny(path, roots) {
+  for (const root of Array.isArray(roots) ? roots : []) {
     if (typeof root !== 'string') continue
     if (await isPathUnder(path, root)) return true
   }

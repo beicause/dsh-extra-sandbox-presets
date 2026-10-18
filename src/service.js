@@ -28,7 +28,7 @@
  * to the live table and the client catalog is invalidated.
  */
 
-import { Service, type Context } from '@deepseek-ai/cordis'
+import { Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { applyExtraDirsFence } from './fs.js'
 import { applyExtraDirsConfine } from './provider.js'
@@ -43,9 +43,17 @@ import {
   expandPresetDirs,
   normalizePresets,
   presetSpecOf,
-  type PresetEntry,
-  type PresetSpec,
 } from './presets.js'
+
+/** @typedef {import('./contracts.js').PresetEntry} PresetEntry */
+/** @typedef {import('./contracts.js').PresetSpec} PresetSpec */
+/** @typedef {import('./contracts.js').SessionLike} SessionLike */
+/** @typedef {import('./contracts.js').ResolvedPolicy} ResolvedPolicy */
+/** @typedef {import('./contracts.js').SandboxPolicyHost} SandboxPolicyHost */
+/** @typedef {import('./contracts.js').PermissionTableHost} PermissionTableHost */
+/** @typedef {import('./contracts.js').PromptRegistry} PromptRegistry */
+/** @typedef {import('./contracts.js').ReportableRejection} ReportableRejection */
+/** @typedef {import('./contracts.js').SandboxPresetsConfig} SandboxPresetsConfig */
 
 export const name = 'dsh-extra-sandbox-presets'
 
@@ -54,47 +62,6 @@ const PERMISSIONS_KEY = 'permissions'
 
 /** The one sandbox mode that never confines, so extra directories are moot. */
 const UNCONFINED_MODE = 'danger-full-access'
-
-/**
- * The validated plugin config this service reads.
- *
- * `presets` is volatile, so it is a live reference rather than a value; the
- * concrete type is left open because the service normalizes it itself and a
- * unit test may hand it a plain table.
- */
-export interface SandboxPresetsConfig {
-  readonly presets: unknown
-}
-
-/** The resolved per-call policy fields the enforcement path consults. */
-interface ResolvedPolicy {
-  readonly mode?: unknown
-  readonly sessionId?: unknown
-  readonly workspaceRoot?: unknown
-}
-
-/** The parts of a session this plugin reads to find its workspace. */
-interface SessionLike {
-  readonly id?: unknown
-  readonly header?: { readonly cwd?: unknown }
-}
-
-/**
- * The sandbox policy service, read only to recover the workspace root the
- * harness folds for a session. Resolving through the service keeps this
- * plugin's workspace boundary identical to the one the stock policy states.
- */
-interface SandboxPolicyHost {
-  resolve?(request: { session?: unknown; mode?: unknown }): { workspaceRoot?: unknown } | undefined
-}
-
-/** The permission service surface this plugin publishes into. */
-interface PermissionTableHost {
-  /** The live preset table; `private` in the shipped typings, so declared here. */
-  readonly presets: Record<string, PresetSpec>
-  /** Invalidates a client's cached permission catalog. */
-  emitCatalogChanged?(): void
-}
 
 /**
  * This plugin's own runtime-context entry, placed directly after the stock
@@ -113,36 +80,35 @@ const NOTE_CONTEXT = 'sandbox:preset-write-dirs'
 /** The registry placement name of the stock sandbox policy note. */
 const POLICY_PLACEMENT = 'SANDBOX_POLICY'
 
-/** The prompt registry this plugin registers its note with. */
-interface PromptRegistry {
-  context(input: {
-    name: string
-    order: number
-    text: (context: { agent?: { session?: unknown } }) => string
-  }): unknown
-  getContextOrder(name: string): number
-}
-/** One rejection reported to the operator, from either normalization stage. */
-interface ReportableRejection {
-  readonly name: string
-  /** Present only for a directory that failed to expand. */
-  readonly entry?: unknown
-  readonly reason: string
-}
+/**
+ * Read a service by name from the composition context. `Context.get` is not
+ * declared on the slice of the typings this package sees, so the call goes
+ * through one checked cast here instead of at every use.
+ *
+ * @param {import('@deepseek-ai/cordis').Context} ctx - the composition context.
+ * @param {string} serviceName - the service name to read.
+ * @returns {unknown} the mounted service, or `undefined` when there is none.
+ */
+const serviceOf = (ctx, serviceName) =>
+  /** @type {{ get?: (name: string) => unknown }} */ (ctx).get?.(serviceName)
 
-const isPermissionTableHost = (value: unknown): value is PermissionTableHost =>
-  typeof value === 'object' && value !== null && typeof (value as PermissionTableHost).presets === 'object'
+/**
+ * @param {unknown} value
+ * @returns {value is PermissionTableHost}
+ */
+const isPermissionTableHost = (value) =>
+  typeof value === 'object' && value !== null && typeof /** @type {PermissionTableHost} */ (value).presets === 'object'
 
 /**
  * The workspace root one resolved policy carries. The enforcing services
  * receive the resolved policy, so its own root is preferred over re-resolving;
  * the session's cwd is the fallback for a partial policy.
  *
- * @param policy - the resolved per-call policy.
- * @param session - the session the call belongs to, when one was found.
- * @returns the absolute workspace root, or `undefined` when neither carries one.
+ * @param {ResolvedPolicy} policy - the resolved per-call policy.
+ * @param {SessionLike | undefined} session - the session the call belongs to, when one was found.
+ * @returns {string | undefined} the absolute workspace root, or `undefined` when neither carries one.
  */
-const workspaceRootOf = (policy: ResolvedPolicy, session: SessionLike | undefined): string | undefined => {
+const workspaceRootOf = (policy, session) => {
   const own = policy.workspaceRoot
   if (typeof own === 'string' && isAbsolute(own)) return own
   const cwd = session?.header?.cwd
@@ -169,39 +135,34 @@ export class ExtraSandboxPresetsService extends Service {
     })).default({}).volatile(),
   })
 
-  /** The validated plugin config this instance serves. */
-  readonly config: SandboxPresetsConfig
-
-  /** Normalized configured presets, in configuration order. */
-  private _presets: PresetEntry[] = []
-
-  /** Canonical directories per preset name. */
-  private _dirs = new Map<string, string[]>()
-
-  /** Workspace subpaths per preset name, resolved against a session's workspace. */
-  private _workspace = new Map<string, string[]>()
-
-  /** Comparison key of the table the current snapshot came from. */
-  private _key: string | undefined = undefined
-
-  /** Rejections already logged, so the warning is not repeated per refresh. */
-  private _reported: string | undefined = undefined
-
-  /** Guards the one-time unsupported-backend warning. */
-  private _unsupportedReported = false
-
-  /** Enforcement services already reported as missing the expected seam. */
-  private readonly _unrecognizedReported = new Set<string>()
-
-  /** Republish hook, installed once the permission service is available. */
-  private _publish: (() => void) | undefined = undefined
-
-  /** The in-flight directory expansion, so callers can settle it. */
-  private _pending: Promise<void> | undefined = undefined
-
-  constructor(ctx: Context, config: SandboxPresetsConfig) {
+  /**
+   * The validated plugin config this instance serves.
+   *
+   * @param {import('@deepseek-ai/cordis').Context} ctx - the composition context.
+   * @param {SandboxPresetsConfig} config - the validated plugin config.
+   */
+  constructor(ctx, config) {
     super(ctx, 'sandboxPresets')
+    /** The validated plugin config this instance serves. @type {SandboxPresetsConfig} */
     this.config = config
+    /** Normalized configured presets, in configuration order. @type {PresetEntry[]} */
+    this._presets = []
+    /** Canonical directories per preset name. @type {Map<string, string[]>} */
+    this._dirs = new Map()
+    /** Workspace subpaths per preset name. @type {Map<string, string[]>} */
+    this._workspace = new Map()
+    /** Comparison key of the table the current snapshot came from. @type {string | undefined} */
+    this._key = undefined
+    /** Rejections already logged, so the warning is not repeated per refresh. @type {string | undefined} */
+    this._reported = undefined
+    /** Guards the one-time unsupported-backend warning. @type {boolean} */
+    this._unsupportedReported = false
+    /** Enforcement services already reported as missing the expected seam. @type {Set<string>} */
+    this._unrecognizedReported = new Set()
+    /** Republish hook, installed once the permission service is available. @type {(() => void) | undefined} */
+    this._publish = undefined
+    /** The in-flight directory expansion, so callers can settle it. @type {Promise<void> | undefined} */
+    this._pending = undefined
     this._refresh()
     this._publishPresets()
     this._publishContext()
@@ -214,17 +175,19 @@ export class ExtraSandboxPresetsService extends Service {
    * calls without one have no session and therefore selected no preset, so they
    * get none.
    *
-   * @param policy - the resolved per-call policy, or `undefined` for a default call.
-   * @returns the canonical directories the call may additionally write.
+   * @param {unknown} [policy] - the resolved per-call policy, or `undefined` for a default call.
+   * @returns {readonly string[]} the canonical directories the call may additionally write.
    */
-  extraRootsFor(policy: unknown): readonly string[] {
-    const resolved = policy as ResolvedPolicy | undefined
+  extraRootsFor(policy = undefined) {
+    const resolved = /** @type {ResolvedPolicy | undefined} */ (policy)
     if (resolved === undefined || resolved === null) return []
     if (resolved.mode === UNCONFINED_MODE) return []
     this._refresh()
     const sessionId = resolved.sessionId
     if (sessionId === undefined || sessionId === null) return []
-    const session = this.ctx.get('sessions')?.get?.(sessionId) as SessionLike | undefined
+    const session = /** @type {SessionLike | undefined} */ (
+      /** @type {{ get?: (id: unknown) => unknown } | undefined} */ (serviceOf(this.ctx, 'sessions'))?.get?.(sessionId)
+    )
     const entry = session === undefined ? undefined : this.presetFor(session)
     if (entry === undefined) return []
     return this.resolvedDirsFor(entry.name, workspaceRootOf(resolved, session))
@@ -240,10 +203,10 @@ export class ExtraSandboxPresetsService extends Service {
    * plugin expects it is reported rather than passed over in silence, so a
    * harness upgrade that moves the seam is visible.
    */
-  private _installEnforcement(): void {
-    for (const serviceName of ['fs', 'sandbox'] as const) {
+  _installEnforcement() {
+    for (const serviceName of /** @type {const} */ (['fs', 'sandbox'])) {
       this.ctx.inject([serviceName], (scope) => {
-        const service = (scope as unknown as Record<string, unknown>)[serviceName]
+        const service = /** @type {Record<string, unknown>} */ (/** @type {unknown} */ (scope))[serviceName]
         scope.effect(() => {
           const disposer = serviceName === 'fs'
             ? applyExtraDirsFence(service, (policy) => this.extraRootsFor(policy))
@@ -265,9 +228,9 @@ export class ExtraSandboxPresetsService extends Service {
    * Report once that a mounted enforcement service does not expose the seam
    * this plugin extends, so an upgraded harness that moved it is visible
    * instead of leaving the presets quietly narrower than they claim.
-   * @param serviceName - the service that could not be wrapped.
+   * @param {string} serviceName - the service that could not be wrapped.
    */
-  private _reportUnrecognized(serviceName: string): void {
+  _reportUnrecognized(serviceName) {
     const key = `unrecognized:${serviceName}`
     if (this._unrecognizedReported.has(key)) return
     this._unrecognizedReported.add(key)
@@ -281,9 +244,9 @@ export class ExtraSandboxPresetsService extends Service {
   /**
    * Report once that the selected backend cannot honor the configured
    * directories, so the gap is visible instead of silently narrowing a preset.
-   * @param runner - the runner program the stock provider selected.
+   * @param {string} runner - the runner program the stock provider selected.
    */
-  private _reportUnsupported(runner: string): void {
+  _reportUnsupported(runner) {
     if (this._unsupportedReported) return
     this._unsupportedReported = true
     this._warn(
@@ -297,15 +260,15 @@ export class ExtraSandboxPresetsService extends Service {
    * The configured presets, normalized and in configuration order. The field is
    * volatile, so it is read through its reference; a plain table (an
    * unvalidated config in a unit test) is accepted too.
-   * @returns the current entries.
+   * @returns {readonly PresetEntry[]} the current entries.
    */
-  presets(): readonly PresetEntry[] {
+  presets() {
     this._refresh()
     return this._presets
   }
 
   /** The configured preset names, in the order the picker offers them. */
-  get presetNames(): readonly string[] {
+  get presetNames() {
     this._refresh()
     return this._presets.map((entry) => entry.name)
   }
@@ -314,20 +277,27 @@ export class ExtraSandboxPresetsService extends Service {
    * The configured preset a session has selected, if any. Read from the
    * permission service's projection (the last recorded permission preset).
    *
-   * @param session - the calling session, or `undefined` for agentless calls.
-   * @returns the selected configured preset, or `undefined`.
+   * @param {unknown} [session] - the calling session, or `undefined` for agentless calls.
+   * @returns {PresetEntry | undefined} the selected configured preset, or `undefined`.
    */
-  presetFor(session: unknown): PresetEntry | undefined {
+  presetFor(session = undefined) {
     this._refresh()
     if (session === undefined || session === null) return undefined
-    const state = this.ctx.get('sessionProjections')?.stateOf?.(session, PERMISSIONS_KEY)
-    const selected: unknown = state?.preset
+    const state = /** @type {{ stateOf?: (session: unknown, key: string) => { preset?: unknown } | undefined }} */ (
+      serviceOf(this.ctx, 'sessionProjections')
+    )?.stateOf?.(session, PERMISSIONS_KEY)
+    const selected = state?.preset
     if (typeof selected !== 'string') return undefined
     return this._presets.find((entry) => entry.name === selected)
   }
 
-  /** The canonical directories one configured preset grants. */
-  dirsForPreset(presetName: string): readonly string[] {
+  /**
+   * The canonical directories one configured preset grants.
+   *
+   * @param {string} presetName - one configured preset name.
+   * @returns {readonly string[]} the canonical directories of that preset.
+   */
+  dirsForPreset(presetName) {
     return this._dirs.get(presetName) ?? []
   }
 
@@ -341,11 +311,11 @@ export class ExtraSandboxPresetsService extends Service {
    * workspace is, instead of being pinned to whatever the process default was
    * when the plugin loaded.
    *
-   * @param presetName - one configured preset name.
-   * @param workspaceRoot - the workspace root of the calling session.
-   * @returns the canonical directories plus the resolved workspace entries.
+   * @param {string} presetName - one configured preset name.
+   * @param {string | undefined} workspaceRoot - the workspace root of the calling session.
+   * @returns {readonly string[]} the canonical directories plus the resolved workspace entries.
    */
-  resolvedDirsFor(presetName: string, workspaceRoot: string | undefined): readonly string[] {
+  resolvedDirsFor(presetName, workspaceRoot) {
     const fixed = this.dirsForPreset(presetName)
     const subpaths = this._workspace.get(presetName) ?? []
     if (subpaths.length === 0 || workspaceRoot === undefined) return fixed
@@ -357,14 +327,14 @@ export class ExtraSandboxPresetsService extends Service {
    * The canonical directories that apply to one call: the selected preset's
    * directories while a configured preset is selected, otherwise none.
    *
-   * @param session - the calling session, or `undefined` for agentless calls.
-   * @returns the canonical directories the call may additionally write.
+   * @param {unknown} [session] - the calling session, or `undefined` for agentless calls.
+   * @returns {readonly string[]} the canonical directories the call may additionally write.
    */
-  rootsFor(session: unknown): readonly string[] {
+  rootsFor(session = undefined) {
     this._refresh()
     const entry = this.presetFor(session)
     if (entry === undefined) return []
-    return this.resolvedDirsFor(entry.name, this.workspaceRootFor(session as SessionLike | undefined))
+    return this.resolvedDirsFor(entry.name, this.workspaceRootFor(/** @type {SessionLike | undefined} */ (session)))
   }
 
   /**
@@ -374,12 +344,12 @@ export class ExtraSandboxPresetsService extends Service {
    * same one the stock `sandbox:policy` note names; a session's own `cwd` is
    * the direct fallback when that service is unavailable.
    *
-   * @param session - the calling session, or `undefined` for agentless calls.
-   * @returns the absolute workspace root, or `undefined` when none can be found.
+   * @param {SessionLike | undefined} session - the calling session, or `undefined` for agentless calls.
+   * @returns {string | undefined} the absolute workspace root, or `undefined` when none can be found.
    */
-  private workspaceRootFor(session: SessionLike | undefined): string | undefined {
+  workspaceRootFor(session) {
     if (session === undefined || session === null) return undefined
-    const policy = this.ctx.get('sandboxPolicy') as SandboxPolicyHost | undefined
+    const policy = /** @type {SandboxPolicyHost | undefined} */ (serviceOf(this.ctx, 'sandboxPolicy'))
     const resolved = policy?.resolve?.({ session })?.workspaceRoot
     if (typeof resolved === 'string' && isAbsolute(resolved)) return resolved
     const own = session.header?.cwd
@@ -391,13 +361,15 @@ export class ExtraSandboxPresetsService extends Service {
    * id a resolved policy carries. Calls without one have no session and
    * therefore selected no preset, so they get none.
    *
-   * @param sessionId - the session id from the resolved policy.
-   * @returns the canonical directories the call may additionally write.
+   * @param {unknown} [sessionId] - the session id from the resolved policy.
+   * @returns {readonly string[]} the canonical directories the call may additionally write.
    */
-  rootsForSessionId(sessionId: unknown): readonly string[] {
+  rootsForSessionId(sessionId = undefined) {
     this._refresh()
     if (sessionId === undefined || sessionId === null) return []
-    const session = this.ctx.get('sessions')?.get?.(sessionId)
+    const session = /** @type {{ get?: (id: unknown) => unknown } | undefined} */ (
+      serviceOf(this.ctx, 'sessions')
+    )?.get?.(sessionId)
     return session === undefined ? [] : this.rootsFor(session)
   }
 
@@ -406,8 +378,10 @@ export class ExtraSandboxPresetsService extends Service {
    * asynchronous (it resolves symlinks), so the previous snapshot keeps serving
    * callers until the refresh settles; a directory therefore becomes writable
    * only after its own successful expansion, never before.
+   *
+   * @returns {Promise<void> | undefined} the in-flight expansion, if any.
    */
-  private _refresh(): Promise<void> | undefined {
+  _refresh() {
     const { entries, rejected } = normalizePresets(this.config.presets)
     const key = JSON.stringify(entries)
     if (key === this._key) return this._pending
@@ -420,7 +394,7 @@ export class ExtraSandboxPresetsService extends Service {
       this._dirs = roots
       this._workspace = workspaceRoots
       this._report([...rejected, ...unusable])
-    }, (error: unknown) => {
+    }, (error) => {
       this._warn(`expanding the configured writable directories failed: ${detailOf(error)}`)
     })
     return this._pending
@@ -430,13 +404,14 @@ export class ExtraSandboxPresetsService extends Service {
    * Settle the current expansion. Callers that need the configured directories
    * to be in force already (startup, tests) await this; the enforcement path
    * deliberately does not, it serves the last settled snapshot.
-   * @returns a promise resolved once the current expansion has settled.
+   * @returns {Promise<void>} a promise resolved once the current expansion has settled.
    */
-  async ready(): Promise<void> {
+  async ready() {
     await this._refresh()
   }
 
-  private _report(rejected: readonly ReportableRejection[]): void {
+  /** @param {readonly ReportableRejection[]} rejected */
+  _report(rejected) {
     if (rejected.length === 0) {
       this._reported = undefined
       return
@@ -449,9 +424,10 @@ export class ExtraSandboxPresetsService extends Service {
     this._warn(`ignoring unusable configured presets: ${summary}`)
   }
 
-  private _warn(message: string): void {
+  /** @param {string} message */
+  _warn(message) {
     try {
-      this.ctx.logger?.warn?.(`extra-sandbox-presets: ${message}`)
+      /** @type {{ logger?: { warn?: (message: string) => void } }} */ (/** @type {unknown} */ (this.ctx)).logger?.warn?.(`extra-sandbox-presets: ${message}`)
     } catch {
       // A logger failure must never affect enforcement.
     }
@@ -468,20 +444,21 @@ export class ExtraSandboxPresetsService extends Service {
    * them so its `defaultPreset` resolves without this plugin) is shadowed while
    * this plugin is loaded and restored exactly when it unloads.
    */
-  private _publishPresets(): void {
+  _publishPresets() {
     this.ctx.inject(['permissionPresets'], (scope) => {
-      const permissions = (scope as unknown as { permissionPresets?: unknown }).permissionPresets
+      const permissions = /** @type {{ permissionPresets?: unknown }} */ (scope).permissionPresets
       scope.effect(() => {
         /** Names this plugin wrote, mapped to the value it replaced. */
-        const applied = new Map<string, PresetSpec | undefined>()
+        /** @type {Map<string, PresetSpec | undefined>} */
+        const applied = new Map()
 
-        const sync = (): void => {
+        const sync = () => {
           if (!isPermissionTableHost(permissions)) {
             this._warn('the permission service does not expose its preset table; the configured presets stay unpublished')
             return
           }
           const table = permissions.presets
-          const wanted = new Map(this._presets.map((entry) => [entry.name, presetSpecOf(entry)] as const))
+          const wanted = new Map(this._presets.map((entry) => [entry.name, presetSpecOf(entry)]))
           for (const [presetName, previous] of applied) {
             if (wanted.has(presetName)) continue
             if (previous === undefined) delete table[presetName]
@@ -523,9 +500,9 @@ export class ExtraSandboxPresetsService extends Service {
    * directory, and empty contexts are dropped from the snapshot, so no note
    * appears where this plugin grants nothing.
    */
-  private _publishContext(): void {
+  _publishContext() {
     this.ctx.inject(['systemPrompt'], (scope) => {
-      const registry = (scope as unknown as { systemPrompt?: PromptRegistry }).systemPrompt
+      const registry = /** @type {{ systemPrompt?: PromptRegistry }} */ (scope).systemPrompt
       if (typeof registry?.context !== 'function') return
       // Directly after the stock note, which states the boundary the exception
       // is read against. Both orders come from the registry so a harness that
@@ -555,16 +532,16 @@ export class ExtraSandboxPresetsService extends Service {
    * in force to answer whether a path is writable. The injector is named so the
    * note can be traced back to its source.
    *
-   * @param session - the calling session, or `undefined` for agentless calls.
-   * @returns the note, or an empty string when no directory applies.
+   * @param {unknown} [session] - the calling session, or `undefined` for agentless calls.
+   * @returns {string} the note, or an empty string when no directory applies.
    */
-  private noteFor(session: unknown): string {
+  noteFor(session = undefined) {
     this._refresh()
     const entry = this.presetFor(session)
     if (entry === undefined || entry.sandbox === UNCONFINED_MODE) return ''
     // Workspace entries are named by the real path they resolve to for this
     // session, so the model is told where the directories actually are.
-    const roots = this.resolvedDirsFor(entry.name, this.workspaceRootFor(session as SessionLike | undefined))
+    const roots = this.resolvedDirsFor(entry.name, this.workspaceRootFor(/** @type {SessionLike | undefined} */ (session)))
     if (roots.length === 0) return ''
     return `The ${name} plugin additionally allows writing these configured directories`
       + ` while the "${entry.name}" preset is selected`
@@ -575,9 +552,14 @@ export class ExtraSandboxPresetsService extends Service {
   }
 }
 
-/** The message of an unknown failure, reproducing `String(error?.message ?? error)`. */
-function detailOf(error: unknown): string {
-  const message = (error as { message?: unknown } | undefined)?.message
+/**
+ * The message of an unknown failure, reproducing `String(error?.message ?? error)`.
+ *
+ * @param {unknown} error
+ * @returns {string}
+ */
+function detailOf(error) {
+  const message = /** @type {{ message?: unknown } | undefined} */ (error)?.message
   return String(message ?? error)
 }
 

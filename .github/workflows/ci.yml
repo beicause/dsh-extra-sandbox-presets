@@ -20,9 +20,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The oldest supported runtime and the current one. `node --test` and
-        # native type stripping are the only runtime features this repository
-        # relies on, so the spread is kept narrow on purpose.
+        # The oldest supported runtime and the current one. The package is plain
+        # JavaScript, so the spread is kept narrow on purpose only to cover both
+        # node --test behaviours (directory vs. file-list handling).
         node: ['22', '24']
     steps:
       - uses: actions/checkout@v4
@@ -65,15 +65,10 @@ jobs:
         # happens to be on the machine.
         run: pnpm install --frozen-lockfile
 
-      - name: Build
-        # The suites import the compiled output under `lib/`, which is a build
-        # artifact and not tracked, so it has to exist before anything that
-        # loads it runs.
-        run: pnpm run build
-
       - name: Typecheck
-        # The declaration files under `lib/` are what the suites' imports
-        # resolve to, so this also checks that comment above.
+        # The sources are JavaScript with JSDoc types, checked in place against
+        # the declaration module that carries the structural contracts. There is
+        # no build step: the package runs from source.
         run: pnpm run typecheck
 
       - name: Test
@@ -104,8 +99,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build
-        run: pnpm run build
+      - name: Typecheck
+        run: pnpm run typecheck
 
       - name: Fail when a test skipped
         # Every case pins an interface this plugin depends on, so a skip means
