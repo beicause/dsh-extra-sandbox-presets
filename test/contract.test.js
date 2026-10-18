@@ -18,7 +18,8 @@ import test from 'node:test';
 import { applyExtraDirsConfine } from '../src/provider.js';
 import { applyExtraDirsFence } from '../src/fs.js';
 import { optionalImport } from './support/host.js';
-import { asFsClass, asSandboxClass } from './support/views.js';
+import { Context } from '@deepseek-ai/cordis';
+import { asFsSeam } from './support/views.js';
 /**
  * Import a DSH package, resolving it from the pnpm store that installed the
  * running `dsh` when a bare specifier does not resolve. A linked plugin does
@@ -39,20 +40,21 @@ test('the stock filesystem still offers the seam the fence wrapper needs', {
 }, async () => {
     if (fsSandbox === undefined)
         return;
-    const Files = asFsClass(fsSandbox.SandboxedFileSystem);
-    const proto = Files.prototype;
+    const proto = asFsSeam(fsSandbox.SandboxedFileSystem.prototype);
     // `applyExtraDirsFence` calls these two, and requires the first to reject
     // containment with this exact code before it retries against extra roots.
     assert.equal(typeof proto.checkedTarget, 'function', 'checkedTarget is the seam the fence wraps');
     assert.equal(typeof proto.resolve, 'function', 'the wrapper re-resolves through this');
-    const instance = new Files({ reflect: { provide() { } }, sandboxPolicy: { defaultMode: 'workspace-write' } }, Files.Config({ cwd: process.cwd() }));
+    const ctx = new Context();
+    /** @type {import('@deepseek-ai/cordis').Context & { sandboxPolicy: { defaultMode: import('@deepseek-ai/dsh-sandbox').SandboxMode } }} */ (ctx).sandboxPolicy = { defaultMode: 'workspace-write' };
+    const instance = new fsSandbox.SandboxedFileSystem(ctx, fsSandbox.SandboxedFileSystem.Config({ cwd: process.cwd() }));
     // Inherited, not own: the wrapper records the descriptor so restore is exact.
     assert.equal(Object.hasOwn(instance, 'checkedTarget'), false, 'the seam is inherited, as the wrapper assumes');
     // The wrapper must recognize this instance, i.e. it must be wrappable.
     const dispose = applyExtraDirsFence(instance, () => []);
     assert.equal(typeof dispose, 'function', 'the real filesystem instance is recognized and wrapped');
     dispose?.();
-    assert.equal(instance.checkedTarget, proto.checkedTarget, 'restoring returns the inherited method');
+    assert.equal(asFsSeam(instance).checkedTarget, proto.checkedTarget, 'restoring returns the inherited method');
     // A denial carries the code the wrapper keys on. Proven through the real
     // fence rather than a stand-in, so a code rename fails here.
     const outside = await instance.resolve('/');
@@ -67,16 +69,15 @@ test('the stock sandbox provider still offers the seam the confine wrapper needs
 }, async () => {
     if (sandboxLocal === undefined)
         return;
-    const Provider = asSandboxClass(sandboxLocal.LocalSandboxProvider);
-    const proto = Provider.prototype;
+    const proto = sandboxLocal.LocalSandboxProvider.prototype;
     const base = Object.getPrototypeOf(sandboxLocal.LocalSandboxProvider);
     assert.equal(typeof proto.confine, 'function', 'confine is the seam the provider wrapper wraps');
     // The wrapper awaits the stock call, which is why a sync-to-async change is
     // safe for it, but the result must still be an object carrying `argv`.
     assert.equal(proto.confine.constructor.name, 'AsyncFunction', 'the wrapper awaits this call');
-    const instance = new Provider({ reflect: { provide() { } }, effect: () => () => { }, inject: () => { }, logger: { warn() { } } }, 
+    const instance = new sandboxLocal.LocalSandboxProvider(new Context(), 
     // Validate through the real schema so required defaults are present.
-    Provider.Config({
+    sandboxLocal.LocalSandboxProvider.Config({
         runnerCommand: [],
         runnerFailureSignatures: [],
         probeTimeoutMs: 5_000,

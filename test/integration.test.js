@@ -14,7 +14,8 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import { optionalImport } from './support/host.js';
-import { asFsClass, asSandboxClass } from './support/views.js';
+import { Context } from '@deepseek-ai/cordis';
+
 /**
  * Import a DSH package, resolving it from the pnpm store that installed the
  * running `dsh` when a bare specifier does not resolve. A linked plugin does
@@ -484,15 +485,11 @@ test('wrapping the live filesystem widens only the selected preset and session',
         const inside = { id: 'inside' };
         const outside = { id: 'outside' };
         // The REAL stock filesystem, mounted as the composition would.
-        const Files = asFsClass(fsSandbox.SandboxedFileSystem);
-        const fs = new Files(
-        // Its constructor registers the service and reads `ctx.sandboxPolicy`.
-        {
-            reflect: { provide() { } },
-            sandboxPolicy: { defaultMode: 'workspace-write' },
-        }, 
+        const fsCtx = new Context();
+        /** @type {import('@deepseek-ai/cordis').Context & { sandboxPolicy: { defaultMode: import('@deepseek-ai/dsh-sandbox').SandboxMode } }} */ (fsCtx).sandboxPolicy = { defaultMode: 'workspace-write' };
+        const fs = new fsSandbox.SandboxedFileSystem(fsCtx, 
         // Validate through the real schema so required defaults are present.
-        Files.Config({ cwd: workspace }));
+        fsSandbox.SandboxedFileSystem.Config({ cwd: workspace }));
         const { ctx } = fakeContext({
             fs,
             // `ctx.inject(['fs', 'sandbox'])` runs the wrapper install immediately.
@@ -512,7 +509,7 @@ test('wrapping the live filesystem widens only the selected preset and session',
         await service.ready();
         const target = await fs.resolve(join(extra, 'note.txt'));
         const scratchTarget = await fs.resolve(join(scratch, 'note.txt'));
-        const policyFor = (/** @type {{ id: string }} */ session, /** @type {string} */ mode = 'workspace-write') => ({ mode, workspaceRoot: workspace, sessionId: session.id });
+        const policyFor = (/** @type {{ id: string }} */ session, /** @type {import('@deepseek-ai/dsh-sandbox').ConfinedSandboxMode} */ mode = 'workspace-write') => ({ mode, workspaceRoot: workspace, sessionId: /** @type {import('@deepseek-ai/dsh-sandbox').SandboxExecutionPolicy['sessionId']} */ (session.id) });
         // Preset off: the stock fence still refuses, i.e. the wrapper never widens
         // beyond what the session selected.
         await assert.rejects(fs.writeText(target, 'a', undefined, undefined, policyFor(inside)), { code: 'FS_SANDBOX_DENIED' });
@@ -556,8 +553,7 @@ test('wrapping the live provider binds the selected preset directories per sessi
         const inside = { id: 'inside' };
         const outside = { id: 'outside' };
         // The REAL stock provider, mounted as the composition would.
-        const Provider = asSandboxClass(sandboxLocal.LocalSandboxProvider);
-        const sandbox = new Provider({ reflect: { provide() { } }, effect: () => () => { }, inject: () => { }, logger: { warn() { } } }, { runnerCommand: [], runnerFailureSignatures: [], probeTimeoutMs: 5_000 });
+        const sandbox = new sandboxLocal.LocalSandboxProvider(new Context(), { runnerCommand: [], runnerFailureSignatures: [], probeTimeoutMs: 5_000 });
         const { ctx } = fakeContext({
             sandbox,
             fs: { async checkedTarget(/** @type {unknown} */ _target, /** @type {unknown} */ _policy) { return 'unused'; } },
@@ -574,7 +570,8 @@ test('wrapping the live provider binds the selected preset directories per sessi
         }));
         await service.ready();
         const argv = ['bash', '-c', 'true'];
-        const policy = (/** @type {{ id: string }} */ session) => ({ mode: 'workspace-write', workspaceRoot: workspace, sessionId: session.id });
+        /** @type {(session: { id: string }) => import('@deepseek-ai/dsh-sandbox').SandboxPolicy} */
+        const policy = (session) => ({ mode: 'workspace-write', workspaceRoot: workspace, sessionId: /** @type {import('@deepseek-ai/dsh-sandbox').SandboxExecutionPolicy['sessionId']} */ (session.id) });
         const bindsOf = (/** @type {{ argv: string[] }} */ confined) => {
             const at = confined.argv.indexOf('--');
             const binds = [];

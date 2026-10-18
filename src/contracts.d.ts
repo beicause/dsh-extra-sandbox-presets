@@ -10,15 +10,15 @@
  * only for its types, as `import('./contracts.js').X`.
  */
 
-/** One sandbox mode a preset may select. */
-export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
+/** One sandbox mode a preset may select, as the sandbox package defines it. */
+export type { SandboxMode } from '@deepseek-ai/dsh-sandbox';
 
 /**
  * The sandbox modes that confine. Only these can be widened by extra
  * directories: `danger-full-access` already allows every path, so a preset
  * selecting it has nothing to add.
  */
-export type ConfinedMode = Exclude<SandboxMode, 'danger-full-access'>;
+export type ConfinedMode = Exclude<import('@deepseek-ai/dsh-sandbox').SandboxMode, 'danger-full-access'>;
 
 /** One approval policy a preset may select. */
 export type ApprovalPolicy = 'ask' | 'never';
@@ -91,27 +91,19 @@ export interface ExpandedPresetDirs {
 /**
  * A config field that may be a live volatile reference rather than a value.
  *
- * Structurally identical to `Volatile<unknown>`, restated here so no module
- * needs a Cordis import to read a config field.
+ * Cordis' `Volatile` is the real shape; this alias only fixes the payload to
+ * `unknown`, because a config field here carries any JSON value.
  */
-export interface VolatileLike {
-  get(): unknown;
-}
+export type VolatileLike = import('@deepseek-ai/cordis').Volatile<unknown>;
 
 /** The resolved target the stock filesystem fence checks and returns. */
-export interface FenceTarget {
-  readonly displayPath: string;
-  readonly targetKey: string;
-}
+export type { FsTarget as FenceTarget } from '@deepseek-ai/dsh-fs';
 
 /** Reports the extra directories that apply to one call's policy. */
 export type ExtraRootsFor = (policy: unknown) => readonly string[];
 
 /** The confined invocation the stock sandbox provider returns. */
-export interface ConfinedArgv {
-  readonly argv: string[];
-  readonly [key: string]: unknown;
-}
+export type { ConfinedArgv } from '@deepseek-ai/dsh-sandbox';
 
 /** Reporting hooks the confine wrapper needs from the service. */
 export interface ConfineDeps {
@@ -127,12 +119,14 @@ export interface SessionLike {
   readonly header?: { readonly cwd?: unknown };
 }
 
-/** The resolved per-call policy fields the enforcement path consults. */
-export interface ResolvedPolicy {
-  readonly mode?: unknown;
-  readonly sessionId?: unknown;
-  readonly workspaceRoot?: unknown;
-}
+/**
+ * The resolved per-call policy fields the enforcement path consults.
+ *
+ * A partial `SandboxExecutionPolicy`: the service reads whatever the policy
+ * service has already resolved, which may leave any field absent for an
+ * agentless call.
+ */
+export type ResolvedPolicy = Partial<import('@deepseek-ai/dsh-sandbox').SandboxExecutionPolicy>;
 
 /** The validated plugin config this service reads. */
 export interface SandboxPresetsConfig {
