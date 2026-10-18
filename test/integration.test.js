@@ -14,6 +14,7 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import { optionalImport } from './support/host.js';
+import { asFsClass, asSandboxClass } from './support/views.js';
 /**
  * Import a DSH package, resolving it from the pnpm store that installed the
  * running `dsh` when a bare specifier does not resolve. A linked plugin does
@@ -21,7 +22,8 @@ import { optionalImport } from './support/host.js';
  * alone skips every contract case — which is exactly the wrong outcome for
  * tests whose purpose is to pin the stock interfaces.
  */
-const dsh = (/** @type {string} */ specifier) => optionalImport(specifier);
+/** @type {typeof optionalImport} */
+const dsh = optionalImport;
 const [cordis, fsSandbox, sandboxLocal] = (await Promise.all([
     dsh('@deepseek-ai/cordis'),
     dsh('@deepseek-ai/dsh-fs-sandbox'),
@@ -54,10 +56,36 @@ const serviceConfig = (schema, config) => /** @type {import('../src/contracts.js
  */
 const volatile = (value) => ({ get: () => value });
 /**
+ * The stand-in context fields the cases and the plugin read. Deliberately
+ * not a real `Context`: the plugin touches a narrow seam, and typing the
+ * double against that seam is what keeps these cases honest. The index
+ * signature carries whatever service a case mounts.
+ *
+ * @typedef {{
+ *   logger: { warn: (message: string) => void, info: (message: string) => void, debug: (message: string) => void },
+ *   reflect: { provide: (name: string, instance: unknown) => void },
+ *   registry: Map<string, unknown>,
+ *   effect: (run: () => unknown) => () => void,
+ *   get: (name: string) => unknown,
+ *   on: (name: string, listener: (...args: unknown[]) => unknown) => () => void,
+ *   inject: (names: string[], callback: (scope: unknown) => unknown) => void,
+ *   disposeEffects: () => void,
+ *   fs?: { checkedTarget: (target: unknown, policy?: unknown) => Promise<unknown>, resolve: (path: string) => Promise<{ displayPath: string }>, writeText: (target: unknown, content: string, expected?: unknown, signal?: unknown, policy?: unknown) => Promise<unknown>, readText: (target: unknown) => Promise<string> },
+ *   [key: string]: unknown,
+ * }} TestContext
+ */
+/**
+ * @typedef {object} FakeContext
+ * @property {TestContext} ctx - the stand-in context.
+ * @property {(() => void)[]} disposers - disposers the service registered.
+ * @property {Map<string, unknown>} registered - services `reflect.provide` received.
+ * @property {Map<string, ((...args: unknown[]) => unknown)[]>} listeners - `on` registrations.
+ */
+/**
  * Build the stand-in context the suites mount the plugin on.
  *
  * @param {Record<string, unknown>} [services] - services the case mounts besides the stand-ins.
- * @returns {{ ctx: any, disposers: (() => void)[], registered: Map<string, unknown>, listeners: Map<string, unknown[]> }}
+ * @returns {FakeContext} the stand-in context and its recorded seams.
  */
 function fakeContext(services = {}) {
     /** @type {(() => void)[]} */
@@ -66,12 +94,12 @@ function fakeContext(services = {}) {
     const registered = new Map();
     /** @type {Map<string, ((...args: unknown[]) => unknown)[]>} */
     const listeners = new Map();
-    /** @type {any} */
+    /** @type {TestContext} */
     const ctx = {
         logger: {
-            warn: (/** @type {unknown[]} */ ..._args) => { },
-            info: (/** @type {unknown[]} */ ..._args) => { },
-            debug: (/** @type {unknown[]} */ ..._args) => { },
+            warn: (/** @type {string} */ _message) => { },
+            info: (/** @type {string} */ _message) => { },
+            debug: (/** @type {string} */ _message) => { },
         },
         reflect: { provide: (/** @type {string} */ name, /** @type {unknown} */ instance) => registered.set(name, instance) },
         registry: new Map(),
@@ -101,6 +129,8 @@ function fakeContext(services = {}) {
                 },
             });
         },
+        // Overwritten below; present so the literal satisfies the typedef.
+        disposeEffects: () => { },
         ...services,
     };
     ctx.disposeEffects = () => {
@@ -454,14 +484,15 @@ test('wrapping the live filesystem widens only the selected preset and session',
         const inside = { id: 'inside' };
         const outside = { id: 'outside' };
         // The REAL stock filesystem, mounted as the composition would.
-        const fs = new fsSandbox.SandboxedFileSystem(
+        const Files = asFsClass(fsSandbox.SandboxedFileSystem);
+        const fs = new Files(
         // Its constructor registers the service and reads `ctx.sandboxPolicy`.
         {
             reflect: { provide() { } },
             sandboxPolicy: { defaultMode: 'workspace-write' },
         }, 
         // Validate through the real schema so required defaults are present.
-        fsSandbox.SandboxedFileSystem.Config({ cwd: workspace }));
+        Files.Config({ cwd: workspace }));
         const { ctx } = fakeContext({
             fs,
             // `ctx.inject(['fs', 'sandbox'])` runs the wrapper install immediately.
@@ -525,7 +556,8 @@ test('wrapping the live provider binds the selected preset directories per sessi
         const inside = { id: 'inside' };
         const outside = { id: 'outside' };
         // The REAL stock provider, mounted as the composition would.
-        const sandbox = new sandboxLocal.LocalSandboxProvider({ reflect: { provide() { } }, effect: () => () => { }, inject: () => { }, logger: { warn() { } } }, { runnerCommand: [], runnerFailureSignatures: [], probeTimeoutMs: 5_000 });
+        const Provider = asSandboxClass(sandboxLocal.LocalSandboxProvider);
+        const sandbox = new Provider({ reflect: { provide() { } }, effect: () => () => { }, inject: () => { }, logger: { warn() { } } }, { runnerCommand: [], runnerFailureSignatures: [], probeTimeoutMs: 5_000 });
         const { ctx } = fakeContext({
             sandbox,
             fs: { async checkedTarget(/** @type {unknown} */ _target, /** @type {unknown} */ _policy) { return 'unused'; } },
@@ -627,7 +659,7 @@ test('a recognized service is wrapped without any warning', { skip }, async () =
     assert.deepEqual(warnings, [], warnings.join('\n'));
     await service.ready();
     // The wrappers are installed and removal restores the originals.
-    const wrapped = ctx.fs;
+    const wrapped = /** @type {NonNullable<TestContext['fs']>} */ (ctx.fs);
     assert.notEqual(wrapped.checkedTarget.name, undefined);
     ctx.disposeEffects();
 });

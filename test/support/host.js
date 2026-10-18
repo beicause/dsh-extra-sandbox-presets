@@ -93,8 +93,19 @@ export const storeResolve = (/** @type {string} */ specifier) => {
 /**
  * Import a package, by bare specifier when this module can see it and through
  * the running `dsh`'s resolution otherwise.
- * @param {string} specifier - the package name.
- * @returns {Promise<any>} the module namespace, or `undefined` when it is not available.
+ *
+ * The known DSH specifiers resolve to their real module types, so a test that
+ * reads a missing export is a type error; anything else falls back to
+ * `unknown`. A JSDoc `@property` map cannot spell quoted keys, so the table
+ * lives in this conditional return type.
+ *
+ * @template {string} S
+ * @param {S} specifier - the package name.
+ * @returns {Promise<(S extends '@deepseek-ai/cordis' ? typeof import('@deepseek-ai/cordis')
+ *   : S extends '@deepseek-ai/dsh-system-prompt' ? typeof import('@deepseek-ai/dsh-system-prompt')
+ *   : S extends '@deepseek-ai/dsh-fs-sandbox' ? typeof import('@deepseek-ai/dsh-fs-sandbox')
+ *   : S extends '@deepseek-ai/dsh-sandbox-local' ? typeof import('@deepseek-ai/dsh-sandbox-local')
+ *   : unknown) | undefined>} the module namespace, or `undefined` when it is not available.
  */
 export const optionalImport = async (specifier) => {
     try {
@@ -118,8 +129,18 @@ export const optionalImport = async (specifier) => {
     return await import(pathToFileURL(entry).href);
 };
 /**
+ * The host a test drives: a real root context plus the helpers the cases use.
+ *
+ * @typedef {object} TestHost
+ * @property {import('@deepseek-ai/cordis').Context} ctx - the root context.
+ * @property {(ms?: number) => Promise<void>} settle - wait for Cordis to settle.
+ * @property {() => Promise<boolean>} mountSystemPrompt - mount the real prompt registry.
+ * @property {(deps: Record<string, unknown>) => Promise<void>} provideDependencies - mount service stubs.
+ * @property {() => Promise<void>} disposeAll - dispose the whole application.
+ */
+/**
  * Create a real Cordis application.
- * @returns the host, or `undefined` when Cordis is not available.
+ * @returns {Promise<TestHost | undefined>} the host, or `undefined` when Cordis is not available.
  */
 export const createHost = async () => {
     const cordis = await optionalImport('@deepseek-ai/cordis');
@@ -147,7 +168,8 @@ export const createHost = async () => {
             // the stubs are mounted as one.
             ctx.plugin({
                 name: 'test-stubs',
-                apply(/** @type {any} */ scope) {
+                /** @param {import('@deepseek-ai/cordis').Context} scope - the live child context. */
+                apply(scope) {
                     for (const [key, value] of Object.entries(dependencies))
                         scope.provide?.(key, value);
                 },
@@ -155,7 +177,7 @@ export const createHost = async () => {
             await settle();
         },
         async disposeAll() {
-            const root = ctx;
+            const root = /** @type {{ dispose?: () => Promise<void> }} */ (ctx);
             await root.dispose?.();
             await settle(50);
         },

@@ -18,6 +18,7 @@ import test from 'node:test';
 import { applyExtraDirsConfine } from '../src/provider.js';
 import { applyExtraDirsFence } from '../src/fs.js';
 import { optionalImport } from './support/host.js';
+import { asFsClass, asSandboxClass } from './support/views.js';
 /**
  * Import a DSH package, resolving it from the pnpm store that installed the
  * running `dsh` when a bare specifier does not resolve. A linked plugin does
@@ -25,24 +26,26 @@ import { optionalImport } from './support/host.js';
  * alone skips every contract case — which is exactly the wrong outcome for
  * tests whose purpose is to pin the stock interfaces.
  */
-/** @param {string} specifier */
-const dsh = (specifier) => optionalImport(specifier);
+/** @type {typeof optionalImport} */
+const dsh = optionalImport;
 const [fsSandbox, sandboxLocal] = (await Promise.all([
     dsh('@deepseek-ai/dsh-fs-sandbox'),
     dsh('@deepseek-ai/dsh-sandbox-local'),
 ]));
+
 /** The seam `src/fs.js` wraps, and the policy fields `src/service.js` reads. */
 test('the stock filesystem still offers the seam the fence wrapper needs', {
     skip: fsSandbox === undefined ? 'the DSH filesystem package is not resolvable here' : false,
 }, async () => {
     if (fsSandbox === undefined)
         return;
-    const proto = fsSandbox.SandboxedFileSystem.prototype;
+    const Files = asFsClass(fsSandbox.SandboxedFileSystem);
+    const proto = Files.prototype;
     // `applyExtraDirsFence` calls these two, and requires the first to reject
     // containment with this exact code before it retries against extra roots.
     assert.equal(typeof proto.checkedTarget, 'function', 'checkedTarget is the seam the fence wraps');
     assert.equal(typeof proto.resolve, 'function', 'the wrapper re-resolves through this');
-    const instance = new fsSandbox.SandboxedFileSystem({ reflect: { provide() { } }, sandboxPolicy: { defaultMode: 'workspace-write' } }, fsSandbox.SandboxedFileSystem.Config({ cwd: process.cwd() }));
+    const instance = new Files({ reflect: { provide() { } }, sandboxPolicy: { defaultMode: 'workspace-write' } }, Files.Config({ cwd: process.cwd() }));
     // Inherited, not own: the wrapper records the descriptor so restore is exact.
     assert.equal(Object.hasOwn(instance, 'checkedTarget'), false, 'the seam is inherited, as the wrapper assumes');
     // The wrapper must recognize this instance, i.e. it must be wrappable.
@@ -64,15 +67,16 @@ test('the stock sandbox provider still offers the seam the confine wrapper needs
 }, async () => {
     if (sandboxLocal === undefined)
         return;
-    const proto = sandboxLocal.LocalSandboxProvider.prototype;
+    const Provider = asSandboxClass(sandboxLocal.LocalSandboxProvider);
+    const proto = Provider.prototype;
     const base = Object.getPrototypeOf(sandboxLocal.LocalSandboxProvider);
     assert.equal(typeof proto.confine, 'function', 'confine is the seam the provider wrapper wraps');
     // The wrapper awaits the stock call, which is why a sync-to-async change is
     // safe for it, but the result must still be an object carrying `argv`.
     assert.equal(proto.confine.constructor.name, 'AsyncFunction', 'the wrapper awaits this call');
-    const instance = new sandboxLocal.LocalSandboxProvider({ reflect: { provide() { } }, effect: () => () => { }, inject: () => { }, logger: { warn() { } } }, 
+    const instance = new Provider({ reflect: { provide() { } }, effect: () => () => { }, inject: () => { }, logger: { warn() { } } }, 
     // Validate through the real schema so required defaults are present.
-    sandboxLocal.LocalSandboxProvider.Config({
+    Provider.Config({
         runnerCommand: [],
         runnerFailureSignatures: [],
         probeTimeoutMs: 5_000,

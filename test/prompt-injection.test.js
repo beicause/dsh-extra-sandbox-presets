@@ -73,7 +73,7 @@ const mountService = async (/** @type {{ presets: Record<string, unknown>, selec
  * Register the stock policy context once. Registration is memoised per host
  * because the registry rejects a duplicate context name.
  */
-const registerPolicyContext = (/** @type {any} */ host) => {
+const registerPolicyContext = (/** @type {import('./support/host.js').TestHost} */ host) => {
     if (registeredHosts.has(host))
         return;
     const registry = host.ctx.get('systemPrompt');
@@ -98,11 +98,11 @@ const textOf = (/** @type {{ name: string, text: string }[]} */ contexts, /** @t
  * @param session - the session to assemble for.
  * @returns the note text in each form.
  */
-const assembleNote = async (/** @type {any} */ host, /** @type {unknown} */ session) => {
+const assembleNote = async (/** @type {import('./support/host.js').TestHost} */ host, /** @type {unknown} */ session) => {
     registerPolicyContext(host);
     const registry = host.ctx.get('systemPrompt');
     assert.ok(registry !== undefined, 'the prompt registry is reachable');
-    const context = { agent: { session } };
+    const context = /** @type {import('@deepseek-ai/dsh-system-prompt').AssembleContext & { agent: { session: unknown } }} */ ({ agent: { session } });
     const assembly = await registry.assemble(context);
     const policy = /** @type {{ name: string, text: string } | undefined} */ (assembly.contexts.find((/** @type {{ name: string }} */ entry) => entry.name === POLICY_CONTEXT));
     assert.ok(policy !== undefined, 'the stock policy context is in the assembly');
